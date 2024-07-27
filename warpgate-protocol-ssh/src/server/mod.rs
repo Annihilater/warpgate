@@ -34,10 +34,10 @@ pub async fn run_server(services: Services, address: SocketAddr) -> Result<()> {
             event_buffer_size: 100,
             preferred: Preferred {
                 key: Cow::Borrowed(&[
-                    russh_keys::key::ED25519,
-                    russh_keys::key::RSA_SHA2_256,
-                    russh_keys::key::RSA_SHA2_512,
-                    russh_keys::key::SSH_RSA,
+                    russh::keys::key::ED25519,
+                    russh::keys::key::RSA_SHA2_256,
+                    russh::keys::key::RSA_SHA2_512,
+                    russh::keys::key::SSH_RSA,
                 ]),
                 ..<_>::default()
             },
@@ -71,7 +71,7 @@ pub async fn run_server(services: Services, address: SocketAddr) -> Result<()> {
 
         let (event_tx, event_rx) = unbounded_channel();
 
-        let handler = ServerHandler { id, event_tx };
+        let handler = ServerHandler { event_tx };
 
         let session = match ServerSession::start(
             remote_address,
