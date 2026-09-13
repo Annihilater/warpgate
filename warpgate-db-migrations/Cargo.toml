@@ -1,24 +1,30 @@
 [package]
-edition = "2021"
-license = "Apache-2.0"
 name = "warpgate-db-migrations"
+version = "0.28.5"
+edition = "2024"
+license = "Apache-2.0"
 publish = false
-version = "0.9.1"
 
 [lib]
 
 [dependencies]
-async-std = { version = "^1.11", features = ["attributes"] }
-chrono = { version = "0.4", default_features = false, features = ["serde"] }
-sea-orm = { version = "0.12.2", features = [
-    "runtime-tokio-native-tls",
-    "macros",
-    "with-chrono",
-    "with-uuid",
-    "with-json",
-], default-features = false }
-sea-orm-migration = { version = "0.12.2", default-features = false, features = [
-    "cli",
-] }
-uuid = { version = "1.2", features = ["v4", "serde"] }
-serde_json = "1.0"
+data-encoding.workspace = true
+regex.workspace = true
+russh.workspace = true
+sea-orm = { workspace = true, features = ["with-uuid", "with-json"] }
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+warpgate-ca = { path = "../warpgate-ca", default-features = false }
+warpgate-common = { path = "../warpgate-common", default-features = false }
+warpgate-db-entities = { path = "../warpgate-db-entities" }
+
+[features]
+postgres = ["sea-orm/sqlx-postgres"]
+mysql = ["sea-orm/sqlx-mysql"]
+sqlite = ["sea-orm/sqlx-sqlite"]

@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use openidconnect::{ClaimsVerificationError, SigningError};
+use openidconnect::{
+    ClaimsVerificationError, ConfigurationError, SignatureVerificationError, SigningError, reqwest,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SsoError {
@@ -20,10 +22,24 @@ pub enum SsoError {
     ClaimsVerification(#[from] ClaimsVerificationError),
     #[error("signing error: {0}")]
     Signing(#[from] SigningError),
+    #[error("reqwest: {0}")]
+    Reqwest(#[from] reqwest::Error),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JWT error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
+    #[error("signature verification: {0}")]
+    SignatureVerification(#[from] SignatureVerificationError),
+    #[error("configuration: {0}")]
+    Configuration(#[from] ConfigurationError),
+    #[error("Google Directory API error: {0}")]
+    GoogleDirectory(String),
+    #[error("the OIDC provider doesn't support RP-initiated logout")]
+    LogoutNotSupported,
+    #[error(
+        "the OIDC provider advertised a {endpoint} of `{url}`: only http and https endpoints are accepted"
+    )]
+    UnsupportedEndpointScheme { endpoint: String, url: String },
     #[error(transparent)]
     Other(Box<dyn Error + Send + Sync>),
 }

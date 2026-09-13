@@ -1,7 +1,7 @@
 use sea_orm::Schema;
 use sea_orm_migration::prelude::*;
 
-mod user {
+pub mod user {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
@@ -31,7 +31,7 @@ mod user {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-mod user_role_assignment {
+pub mod user_role_assignment {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 

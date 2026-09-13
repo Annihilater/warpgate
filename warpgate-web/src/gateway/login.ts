@@ -1,7 +1,9 @@
+import { mount } from 'svelte'
 import Login from './Login.svelte'
 
 const app = {}
-new Login({
+mount(Login, {
+    // biome-ignore lint/style/noNonNullAssertion: x
     target: document.getElementById('app')!,
 })
 

@@ -1,37 +1,36 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
-    ModelTrait, QueryFilter, TransactionTrait,
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityOrSelect, EntityTrait,
+    QueryFilter, QuerySelect,
 };
-use tracing::*;
-use uuid::Uuid;
+use time::OffsetDateTime;
+use tracing::error;
 use warpgate_common::helpers::fs::secure_file;
-use warpgate_common::{
-    ConfigProviderKind, TargetOptions, TargetWebAdminOptions, WarpgateConfig, WarpgateError,
-};
-use warpgate_db_entities::Target::TargetKind;
-use warpgate_db_entities::{
-    LogEntry, Role, Target, TargetRoleAssignment, User, UserRoleAssignment,
-};
-use warpgate_db_migrations::migrate_database;
+use warpgate_common::{GlobalParams, TargetSessionId, WarpgateConfig};
+use warpgate_db_entities::Parameters::ConfigMigrationValues;
+use warpgate_db_entities::{TargetSession, UserSession};
+use warpgate_db_migrations::{migrate_database, migrate_database_down, migrate_database_up};
 
-use crate::consts::{BUILTIN_ADMIN_ROLE_NAME, BUILTIN_ADMIN_TARGET_NAME};
 use crate::recordings::SessionRecordings;
 
-pub async fn connect_to_db(config: &WarpgateConfig) -> Result<DatabaseConnection> {
+/// Open a connection to the configured database without running migrations.
+pub async fn connect_to_db(
+    config: &WarpgateConfig,
+    params: &GlobalParams,
+) -> Result<DatabaseConnection> {
     let mut url = url::Url::parse(&config.store.database_url.expose_secret()[..])?;
+
     if url.scheme() == "sqlite" {
         let path = url.path();
-        let mut abs_path = config.paths_relative_to.clone();
+        let mut abs_path = params.paths_relative_to().clone();
         abs_path.push(path);
         abs_path.push("db.sqlite3");
 
         if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent)?
+            std::fs::create_dir_all(parent)?;
         }
 
         url.set_path(
@@ -39,13 +38,15 @@ pub async fn connect_to_db(config: &WarpgateConfig) -> Result<DatabaseConnection
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("Failed to convert database path to string"))?,
         );
-
         url.set_query(Some("mode=rwc"));
 
-        let db = Database::connect(ConnectOptions::new(url.to_string())).await?;
-        db.begin().await?.commit().await?;
+        let connection = connect_to_sqlite(url.as_str()).await?;
 
-        secure_file(&abs_path)?;
+        if params.should_secure_files() {
+            secure_file(&abs_path)?;
+        }
+
+        return Ok(connection);
     }
 
     let mut opt = ConnectOptions::new(url.to_string());
@@ -58,263 +59,266 @@ pub async fn connect_to_db(config: &WarpgateConfig) -> Result<DatabaseConnection
 
     let connection = Database::connect(opt).await?;
 
+    Ok(connection)
+}
+
+/// WAL mode required to allow multiple concurrent writes to wait for each other
+/// instead of failing
+#[cfg(feature = "sqlite")]
+async fn connect_to_sqlite(url: &str) -> Result<DatabaseConnection> {
+    use std::str::FromStr;
+
+    use sea_orm::SqlxSqliteConnector;
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    let connect_options = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(30));
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(100)
+        .min_connections(5)
+        .acquire_timeout(Duration::from_secs(8))
+        .idle_timeout(Duration::from_secs(8))
+        .max_lifetime(Duration::from_secs(8))
+        .connect_with(connect_options)
+        .await?;
+
+    Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
+#[cfg(not(feature = "sqlite"))]
+async fn connect_to_sqlite(_url: &str) -> Result<DatabaseConnection> {
+    anyhow::bail!("SQLite support is not enabled in this build")
+}
+
+pub async fn connect_to_db_and_migrate(
+    config: &WarpgateConfig,
+    params: &GlobalParams,
+) -> Result<DatabaseConnection> {
+    let connection = connect_to_db(config, params).await?;
+    // Publish the config-file settings that have moved into the parameters row
+    // so the migrations can copy them into the DB; afterwards the config file's
+    // copies are ignored.
+    warpgate_db_entities::Parameters::set_config_migration_values(
+        ConfigMigrationValues::from_config(config),
+    );
     migrate_database(&connection).await?;
     Ok(connection)
 }
 
-pub async fn populate_db(
-    db: &mut DatabaseConnection,
-    config: &mut WarpgateConfig,
-) -> Result<(), WarpgateError> {
-    use sea_orm::ActiveValue::Set;
-    use warpgate_db_entities::{Recording, Session};
-
-    Recording::Entity::update_many()
-        .set(Recording::ActiveModel {
-            ended: Set(Some(chrono::Utc::now())),
-            ..Default::default()
-        })
-        .filter(Expr::col(Recording::Column::Ended).is_null())
-        .exec(db)
-        .await
-        .map_err(WarpgateError::from)?;
-
-    Session::Entity::update_many()
-        .set(Session::ActiveModel {
-            ended: Set(Some(chrono::Utc::now())),
-            ..Default::default()
-        })
-        .filter(Expr::col(Session::Column::Ended).is_null())
-        .exec(db)
-        .await
-        .map_err(WarpgateError::from)?;
-
-    let db_was_empty = Role::Entity::find().all(&*db).await?.is_empty();
-
-    let admin_role = match Role::Entity::find()
-        .filter(Role::Column::Name.eq(BUILTIN_ADMIN_ROLE_NAME))
-        .all(db)
-        .await?
-        .first()
-    {
-        Some(x) => x.to_owned(),
-        None => {
-            let values = Role::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                name: Set(BUILTIN_ADMIN_ROLE_NAME.to_owned()),
-            };
-            values.insert(&*db).await.map_err(WarpgateError::from)?
-        }
-    };
-
-    let admin_target = match Target::Entity::find()
-        .filter(Target::Column::Kind.eq(TargetKind::WebAdmin))
-        .all(db)
-        .await?
-        .first()
-    {
-        Some(x) => x.to_owned(),
-        None => {
-            let values = Target::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                name: Set(BUILTIN_ADMIN_TARGET_NAME.to_owned()),
-                kind: Set(TargetKind::WebAdmin),
-                options: Set(serde_json::to_value(TargetOptions::WebAdmin(
-                    TargetWebAdminOptions {},
-                ))
-                .map_err(WarpgateError::from)?),
-            };
-
-            values.insert(&*db).await.map_err(WarpgateError::from)?
-        }
-    };
-
-    if TargetRoleAssignment::Entity::find()
-        .filter(TargetRoleAssignment::Column::TargetId.eq(admin_target.id))
-        .filter(TargetRoleAssignment::Column::RoleId.eq(admin_role.id))
-        .all(db)
-        .await?
-        .is_empty()
-    {
-        let values = TargetRoleAssignment::ActiveModel {
-            target_id: Set(admin_target.id),
-            role_id: Set(admin_role.id),
-            ..Default::default()
-        };
-        values.insert(&*db).await.map_err(WarpgateError::from)?;
-    }
-
-    if db_was_empty && config.store.config_provider == ConfigProviderKind::Database {
-        migrate_config_into_db(db, config).await?;
-    } else if !config.store.targets.is_empty() {
-        warn!("Warpgate is now using the database for its configuration, but you still have leftover configuration in the config file.");
-        warn!("Configuration changes in the config file will be ignored.");
-        warn!("Remove `targets` and `roles` keys from the config to disable this warning.");
-    }
-
+/// Apply all pending migrations.
+pub async fn migrate_all(connection: &DatabaseConnection) -> Result<()> {
+    migrate_database(connection).await?;
     Ok(())
 }
 
-async fn migrate_config_into_db(
-    db: &mut DatabaseConnection,
-    config: &mut WarpgateConfig,
-) -> Result<(), WarpgateError> {
-    use sea_orm::ActiveValue::Set;
-    info!("Migrating config file into the database");
+/// Apply `steps` pending migrations.
+pub async fn migrate_up(connection: &DatabaseConnection, steps: u32) -> Result<()> {
+    migrate_database_up(connection, steps).await?;
+    Ok(())
+}
 
-    let mut role_lookup = HashMap::new();
-
-    for role_config in config.store.roles.iter() {
-        let role = match Role::Entity::find()
-            .filter(Role::Column::Name.eq(role_config.name.clone()))
-            .all(db)
-            .await?
-            .first()
-        {
-            Some(x) => x.to_owned(),
-            None => {
-                let values = Role::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    name: Set(role_config.name.clone()),
-                };
-                info!("Migrating role {}", role_config.name);
-                values.insert(&*db).await.map_err(WarpgateError::from)?
-            }
-        };
-        role_lookup.insert(role_config.name.clone(), role.id);
-    }
-    config.store.roles = vec![];
-
-    for target_config in config.store.targets.iter() {
-        if TargetKind::WebAdmin == (&target_config.options).into() {
-            continue;
-        }
-        let target = match Target::Entity::find()
-            .filter(Target::Column::Kind.ne(TargetKind::WebAdmin))
-            .filter(Target::Column::Name.eq(target_config.name.clone()))
-            .all(db)
-            .await?
-            .first()
-        {
-            Some(x) => x.to_owned(),
-            None => {
-                let values = Target::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    name: Set(target_config.name.clone()),
-                    kind: Set((&target_config.options).into()),
-                    options: Set(serde_json::to_value(target_config.options.clone())
-                        .map_err(WarpgateError::from)?),
-                };
-
-                info!("Migrating target {}", target_config.name);
-                values.insert(&*db).await.map_err(WarpgateError::from)?
-            }
-        };
-
-        for role_name in target_config.allow_roles.iter() {
-            if let Some(role_id) = role_lookup.get(role_name) {
-                if TargetRoleAssignment::Entity::find()
-                    .filter(TargetRoleAssignment::Column::TargetId.eq(target.id))
-                    .filter(TargetRoleAssignment::Column::RoleId.eq(*role_id))
-                    .all(db)
-                    .await?
-                    .is_empty()
-                {
-                    let values = TargetRoleAssignment::ActiveModel {
-                        target_id: Set(target.id),
-                        role_id: Set(*role_id),
-                        ..Default::default()
-                    };
-                    values.insert(&*db).await.map_err(WarpgateError::from)?;
-                }
-            }
-        }
-    }
-    config.store.targets = vec![];
-
-    for user_config in config.store.users.iter() {
-        let user = match User::Entity::find()
-            .filter(User::Column::Username.eq(user_config.username.clone()))
-            .all(db)
-            .await?
-            .first()
-        {
-            Some(x) => x.to_owned(),
-            None => {
-                let values = User::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    username: Set(user_config.username.clone()),
-                    credentials: Set(serde_json::to_value(user_config.credentials.clone())
-                        .map_err(WarpgateError::from)?),
-                    credential_policy: Set(serde_json::to_value(
-                        user_config.credential_policy.clone(),
-                    )
-                    .map_err(WarpgateError::from)?),
-                };
-
-                info!("Migrating user {}", user_config.username);
-                values.insert(&*db).await.map_err(WarpgateError::from)?
-            }
-        };
-
-        for role_name in user_config.roles.iter() {
-            if let Some(role_id) = role_lookup.get(role_name) {
-                if UserRoleAssignment::Entity::find()
-                    .filter(UserRoleAssignment::Column::UserId.eq(user.id))
-                    .filter(UserRoleAssignment::Column::RoleId.eq(*role_id))
-                    .all(db)
-                    .await?
-                    .is_empty()
-                {
-                    let values = UserRoleAssignment::ActiveModel {
-                        user_id: Set(user.id),
-                        role_id: Set(*role_id),
-                        ..Default::default()
-                    };
-                    values.insert(&*db).await.map_err(WarpgateError::from)?;
-                }
-            }
-        }
-    }
-    config.store.users = vec![];
-
+/// Revert `steps` applied migrations.
+pub async fn migrate_down(connection: &DatabaseConnection, steps: u32) -> Result<()> {
+    migrate_database_down(connection, steps).await?;
     Ok(())
 }
 
 pub async fn cleanup_db(
-    db: &mut DatabaseConnection,
-    recordings: &mut SessionRecordings,
+    db: &DatabaseConnection,
+    recordings: &SessionRecordings,
     retention: &Duration,
+    audit_retention: &Duration,
 ) -> Result<()> {
-    use warpgate_db_entities::{Recording, Session};
-    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(*retention)?;
+    use warpgate_db_entities::{
+        LogEntry, Recording, SessionApprovalRequest, Ticket, TicketRequest,
+    };
+    let audit_cutoff = OffsetDateTime::now_utc() - time::Duration::try_from(*audit_retention)?;
+    let recording_cutoff = OffsetDateTime::now_utc() - time::Duration::try_from(*retention)?;
+
+    SessionApprovalRequest::delete_all_before(db, audit_cutoff).await?;
 
     LogEntry::Entity::delete_many()
-        .filter(Expr::col(LogEntry::Column::Timestamp).lt(cutoff))
+        .filter(Expr::col(LogEntry::Column::Target).eq("audit"))
+        .filter(Expr::col(LogEntry::Column::Timestamp).lt(audit_cutoff))
         .exec(db)
         .await?;
 
-    let recordings_to_delete = Recording::Entity::find()
-        .filter(Expr::col(Session::Column::Ended).is_not_null())
-        .filter(Expr::col(Session::Column::Ended).lt(cutoff))
-        .all(db)
+    LogEntry::Entity::delete_many()
+        .filter(Expr::col(LogEntry::Column::Target).ne("audit"))
+        .filter(Expr::col(LogEntry::Column::Timestamp).lt(recording_cutoff))
+        .exec(db)
         .await?;
 
-    for recording in recordings_to_delete {
-        if let Err(error) = recordings
-            .remove(&recording.session_id, &recording.name)
-            .await
-        {
-            error!(session=%recording.session_id, name=%recording.name, %error, "Failed to remove recording");
+    {
+        let active_ticket_ids = Ticket::Entity::find()
+            .select()
+            .column(Ticket::Column::Id)
+            .filter(
+                Expr::col(Ticket::Column::Expiry)
+                    .is_null()
+                    .or(Expr::col(Ticket::Column::Expiry).gt(OffsetDateTime::now_utc())),
+            )
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|x| x.id)
+            .collect::<Vec<_>>();
+
+        let mut request_deletion = TicketRequest::Entity::delete_many()
+            .filter(Expr::col(TicketRequest::Column::Created).lt(audit_cutoff));
+
+        if !active_ticket_ids.is_empty() {
+            request_deletion = request_deletion.filter(
+                Expr::col(TicketRequest::Column::TicketId)
+                    .is_null()
+                    .or(Expr::col(TicketRequest::Column::TicketId).is_not_in(active_ticket_ids)),
+            );
         }
-        recording.delete(db).await?;
+
+        request_deletion.exec(db).await?;
     }
 
-    Session::Entity::delete_many()
-        .filter(Expr::col(Session::Column::Ended).is_not_null())
-        .filter(Expr::col(Session::Column::Ended).lt(cutoff))
+    // Recordings are cleaned up by their parent session's `ended`, not their
+    // own: a session ended abnormally (inactivity reaper, node shutdown, admin
+    // close) never finalizes its recording, so `recording.ended` stays null and
+    // the files would otherwise leak on disk forever.
+    let expired_session_ids: Vec<TargetSessionId> = TargetSession::Entity::find()
+        .filter(Expr::col(TargetSession::Column::Ended).is_not_null())
+        .filter(Expr::col(TargetSession::Column::Ended).lt(recording_cutoff))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+
+    if !expired_session_ids.is_empty() {
+        let recordings_to_delete = Recording::Entity::find()
+            .filter(
+                Expr::col(Recording::Column::SessionId).is_in(expired_session_ids.iter().copied()),
+            )
+            .all(db)
+            .await?;
+
+        for recording in recordings_to_delete {
+            if let Err(error) = recordings
+                .remove(&recording.session_id, &recording.name)
+                .await
+            {
+                error!(session=%recording.session_id, name=%recording.name, %error, "Failed to remove recording");
+            }
+        }
+
+        // Recording rows are deleted explicitly rather than left to the FK
+        // cascade so that the file removal above and the row removal form one
+        // visible, ordered sequence.
+        Recording::Entity::delete_many()
+            .filter(
+                Expr::col(Recording::Column::SessionId).is_in(expired_session_ids.iter().copied()),
+            )
+            .exec(db)
+            .await?;
+
+        TargetSession::Entity::delete_many()
+            .filter(Expr::col(TargetSession::Column::Id).is_in(expired_session_ids))
+            .exec(db)
+            .await?;
+    }
+
+    // Keep user sessions who still have target sessions referencing them
+    UserSession::Entity::delete_many()
+        .filter(UserSession::Column::Ended.is_not_null())
+        .filter(UserSession::Column::Ended.lt(recording_cutoff))
+        .filter(
+            UserSession::Column::Id.not_in_subquery(
+                sea_orm::sea_query::Query::select()
+                    .column(TargetSession::Column::UserSessionId)
+                    .from(TargetSession::Entity)
+                    .and_where(Expr::col(TargetSession::Column::UserSessionId).is_not_null())
+                    .to_owned(),
+            ),
+        )
         .exec(db)
         .await?;
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{Database, EntityTrait, PaginatorTrait};
+    use uuid::Uuid;
+    use warpgate_db_entities::HttpSession;
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    async fn open_session(db: &DatabaseConnection, node_id: Option<Uuid>) -> Uuid {
+        open_session_for_user(db, node_id, Uuid::new_v4()).await
+    }
+
+    async fn open_session_for_user(
+        db: &DatabaseConnection,
+        node_id: Option<Uuid>,
+        user_id: Uuid,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        UserSession::Entity::insert(UserSession::ActiveModel {
+            id: Set(warpgate_common::UserSessionId(id)),
+            username: Set(Some("alice".into())),
+            user_id: Set(Some(user_id)),
+            remote_address: Set("127.0.0.1:1".into()),
+            started: Set(OffsetDateTime::now_utc()),
+            ended: Set(None),
+            protocol: Set(if node_id.is_some() { "SSH" } else { "HTTP" }.into()),
+            node_id: Set(node_id.map(warpgate_common::NodeId)),
+            auth_state_node_id: Set(None),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The close-everything sweep must reach sessions no node holds a handle
+    /// for — that is its whole point — and log everyone out by deleting their
+    /// stored browser sessions.
+    #[tokio::test]
+    async fn revoke_all_ends_detached_sessions_and_their_cookies() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let direct = open_session(&db, Some(Uuid::new_v4())).await;
+        let detached_http = open_session(&db, None).await;
+        HttpSession::Entity::insert(HttpSession::ActiveModel {
+            id: Set("cookie".into()),
+            expires: Set(None),
+            data: Set("{}".into()),
+            updated: Set(OffsetDateTime::now_utc()),
+            user_session_id: Set(Some(warpgate_common::UserSessionId(detached_http))),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        UserSession::revoke_all(&db).await.unwrap();
+
+        for id in [direct, detached_http] {
+            assert!(
+                UserSession::Entity::find_by_id(warpgate_common::UserSessionId(id))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ended
+                    .is_some()
+            );
+        }
+        assert_eq!(HttpSession::Entity::find().count(&db).await.unwrap(), 0);
+    }
 }

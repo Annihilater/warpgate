@@ -1,14 +1,13 @@
 use std::fmt::Debug;
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use russh::server::{Auth, Handle, Msg, Session};
+use russh::keys::PublicKey;
+use russh::server::{Auth, ChannelOpenHandle, Handle, Msg, Session};
 use russh::{Channel, ChannelId, Pty, Sig};
-use russh_keys::key::PublicKey;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::*;
-use warpgate_common::{Secret, SessionId};
+use warpgate_common::Secret;
 
 use crate::common::{PtyRequest, ServerChannelId};
 use crate::{DirectTCPIPParams, X11Request};
@@ -21,21 +20,28 @@ impl Debug for HandleWrapper {
     }
 }
 
+/// Carries a channel-open reply handle into the session event loop so the
+/// confirmation is sent from the same task that writes channel data, keeping
+/// `CHANNEL_OPEN_CONFIRMATION` ahead of the target's first bytes (#2328).
+pub struct ChannelOpenHandleWrapper(pub ChannelOpenHandle);
+
+impl Debug for ChannelOpenHandleWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChannelOpenHandleWrapper")
+    }
+}
+
 #[derive(Debug)]
 pub enum ServerHandlerEvent {
     Authenticated(HandleWrapper),
-    ChannelOpenSession(ServerChannelId, oneshot::Sender<bool>),
+    ChannelOpenSession(ServerChannelId, ChannelOpenHandleWrapper),
     SubsystemRequest(ServerChannelId, String, oneshot::Sender<bool>),
     PtyRequest(ServerChannelId, PtyRequest, oneshot::Sender<()>),
     ShellRequest(ServerChannelId, oneshot::Sender<bool>),
     AuthPublicKey(Secret<String>, PublicKey, oneshot::Sender<Auth>),
-    AuthPublicKeyOffer(Secret<String>, PublicKey, oneshot::Sender<bool>),
+    AuthPublicKeyOffer(Secret<String>, PublicKey, oneshot::Sender<Auth>),
     AuthPassword(Secret<String>, Secret<String>, oneshot::Sender<Auth>),
-    AuthKeyboardInteractive(
-        Secret<String>,
-        Option<Secret<String>>,
-        oneshot::Sender<Auth>,
-    ),
+    AuthKeyboardInteractive(Secret<String>, Vec<Secret<String>>, oneshot::Sender<Auth>),
     Data(ServerChannelId, Bytes, oneshot::Sender<()>),
     ExtendedData(ServerChannelId, Bytes, u32, oneshot::Sender<()>),
     ChannelClose(ServerChannelId, oneshot::Sender<()>),
@@ -43,17 +49,61 @@ pub enum ServerHandlerEvent {
     WindowChangeRequest(ServerChannelId, PtyRequest, oneshot::Sender<()>),
     Signal(ServerChannelId, Sig, oneshot::Sender<()>),
     ExecRequest(ServerChannelId, Bytes, oneshot::Sender<bool>),
-    ChannelOpenDirectTcpIp(ServerChannelId, DirectTCPIPParams, oneshot::Sender<bool>),
+    ChannelOpenDirectTcpIp(ServerChannelId, DirectTCPIPParams, ChannelOpenHandleWrapper),
+    ChannelOpenDirectStreamlocal(ServerChannelId, String, ChannelOpenHandleWrapper),
     EnvRequest(ServerChannelId, String, String, oneshot::Sender<()>),
     X11Request(ServerChannelId, X11Request, oneshot::Sender<()>),
     TcpIpForward(String, u32, oneshot::Sender<bool>),
     CancelTcpIpForward(String, u32, oneshot::Sender<bool>),
+    StreamlocalForward(String, oneshot::Sender<bool>),
+    CancelStreamlocalForward(String, oneshot::Sender<bool>),
+    AgentForward(ServerChannelId, oneshot::Sender<bool>),
     Disconnect,
 }
 
+impl ServerHandlerEvent {
+    /// The already-open channel this event refers to, if any.
+    /// Channel open events establish new channels and are not included.
+    ///
+    /// Deliberately a total match: event deferral during pending channel
+    /// opens keys off this (#1459), so a new variant must explicitly decide
+    /// whether it names a channel rather than silently defaulting to "no".
+    pub(crate) const fn existing_channel(&self) -> Option<ServerChannelId> {
+        match self {
+            Self::SubsystemRequest(channel, ..)
+            | Self::PtyRequest(channel, ..)
+            | Self::ShellRequest(channel, ..)
+            | Self::Data(channel, ..)
+            | Self::ExtendedData(channel, ..)
+            | Self::ChannelClose(channel, ..)
+            | Self::ChannelEof(channel, ..)
+            | Self::WindowChangeRequest(channel, ..)
+            | Self::Signal(channel, ..)
+            | Self::ExecRequest(channel, ..)
+            | Self::EnvRequest(channel, ..)
+            | Self::X11Request(channel, ..)
+            | Self::AgentForward(channel, ..) => Some(*channel),
+            Self::Authenticated(_)
+            | Self::ChannelOpenSession(..)
+            | Self::AuthPublicKey(..)
+            | Self::AuthPublicKeyOffer(..)
+            | Self::AuthPassword(..)
+            | Self::AuthKeyboardInteractive(..)
+            | Self::ChannelOpenDirectTcpIp(..)
+            | Self::ChannelOpenDirectStreamlocal(..)
+            | Self::TcpIpForward(..)
+            | Self::CancelTcpIpForward(..)
+            | Self::StreamlocalForward(..)
+            | Self::CancelStreamlocalForward(..)
+            | Self::Disconnect => None,
+        }
+    }
+}
+
 pub struct ServerHandler {
-    pub id: SessionId,
     pub event_tx: UnboundedSender<ServerHandlerEvent>,
+    /// Optional custom banner shown to the client during authentication.
+    pub banner: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -70,9 +120,12 @@ impl ServerHandler {
     }
 }
 
-#[async_trait]
 impl russh::server::Handler for ServerHandler {
     type Error = anyhow::Error;
+
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(self.banner.clone())
+    }
 
     async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
         let handle = session.handle();
@@ -83,17 +136,14 @@ impl russh::server::Handler for ServerHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        let (tx, rx) = oneshot::channel();
-
+    ) -> Result<(), Self::Error> {
         self.send_event(ServerHandlerEvent::ChannelOpenSession(
             ServerChannelId(channel.id()),
-            tx,
+            ChannelOpenHandleWrapper(reply),
         ))?;
-
-        let allowed = rx.await.unwrap_or(false);
-        Ok(allowed)
+        Ok(())
     }
 
     async fn subsystem_request(
@@ -112,9 +162,9 @@ impl russh::server::Handler for ServerHandler {
         ))?;
 
         if rx.await.unwrap_or(false) {
-            session.channel_success(channel)
+            session.channel_success(channel)?;
         } else {
-            session.channel_failure(channel)
+            session.channel_failure(channel)?;
         }
 
         Ok(())
@@ -154,7 +204,7 @@ impl russh::server::Handler for ServerHandler {
         ))?;
 
         let _ = rx.await;
-        session.channel_success(channel);
+        session.channel_success(channel)?;
         Ok(())
     }
 
@@ -171,9 +221,9 @@ impl russh::server::Handler for ServerHandler {
         ))?;
 
         if rx.await.unwrap_or(false) {
-            session.channel_success(channel)
+            session.channel_success(channel)?;
         } else {
-            session.channel_failure(channel)
+            session.channel_failure(channel)?;
         }
 
         Ok(())
@@ -182,7 +232,7 @@ impl russh::server::Handler for ServerHandler {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        key: &russh_keys::key::PublicKey,
+        key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         let user = Secret::new(user.to_string());
         let (tx, rx) = oneshot::channel();
@@ -193,20 +243,13 @@ impl russh::server::Handler for ServerHandler {
             tx,
         ))?;
 
-        let result = rx.await.unwrap_or(false);
-        Ok(if result {
-            Auth::Accept
-        } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
-        })
+        Ok(rx.await.unwrap_or_else(|_| Auth::reject()))
     }
 
     async fn auth_publickey(
         &mut self,
         user: &str,
-        key: &russh_keys::key::PublicKey,
+        key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         let user = Secret::new(user.to_string());
         let (tx, rx) = oneshot::channel();
@@ -229,17 +272,21 @@ impl russh::server::Handler for ServerHandler {
         Ok(result)
     }
 
-    async fn auth_keyboard_interactive(
-        &mut self,
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
         user: &str,
         _submethods: &str,
-        response: Option<russh::server::Response<'async_trait>>,
+        response: Option<russh::server::Response<'a>>,
     ) -> Result<Auth, Self::Error> {
         let user = Secret::new(user.to_string());
         let response = response
-            .and_then(|mut r| r.next())
-            .and_then(|b| String::from_utf8(b.to_vec()).ok())
-            .map(Secret::new);
+            .map(|response| {
+                response
+                    .filter_map(|b| String::from_utf8(b.to_vec()).ok())
+                    .map(Secret::new)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let (tx, rx) = oneshot::channel();
 
@@ -309,7 +356,7 @@ impl russh::server::Handler for ServerHandler {
         self.send_event(ServerHandlerEvent::WindowChangeRequest(
             ServerChannelId(channel),
             PtyRequest {
-                term: "".to_string(),
+                term: "".into(),
                 col_width,
                 row_height,
                 pix_width,
@@ -369,9 +416,9 @@ impl russh::server::Handler for ServerHandler {
         ))?;
 
         if rx.await.unwrap_or(false) {
-            session.channel_success(channel)
+            session.channel_success(channel)?;
         } else {
-            session.channel_failure(channel)
+            session.channel_failure(channel)?;
         }
 
         Ok(())
@@ -404,11 +451,11 @@ impl russh::server::Handler for ServerHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let host_to_connect = host_to_connect.to_string();
         let originator_address = originator_address.to_string();
-        let (tx, rx) = oneshot::channel();
         self.send_event(ServerHandlerEvent::ChannelOpenDirectTcpIp(
             ServerChannelId(channel.id()),
             DirectTCPIPParams {
@@ -417,10 +464,25 @@ impl russh::server::Handler for ServerHandler {
                 originator_address,
                 originator_port,
             },
-            tx,
+            ChannelOpenHandleWrapper(reply),
         ))?;
-        let allowed = rx.await.unwrap_or(false);
-        Ok(allowed)
+        Ok(())
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let socket_path = socket_path.to_string();
+        self.send_event(ServerHandlerEvent::ChannelOpenDirectStreamlocal(
+            ServerChannelId(channel.id()),
+            socket_path,
+            ChannelOpenHandleWrapper(reply),
+        ))?;
+        Ok(())
     }
 
     async fn x11_request(
@@ -461,9 +523,9 @@ impl russh::server::Handler for ServerHandler {
         self.send_event(ServerHandlerEvent::TcpIpForward(address, port, tx))?;
         let allowed = rx.await.unwrap_or(false);
         if allowed {
-            session.request_success()
+            session.request_success();
         } else {
-            session.request_failure()
+            session.request_failure();
         }
         Ok(allowed)
     }
@@ -479,9 +541,65 @@ impl russh::server::Handler for ServerHandler {
         self.send_event(ServerHandlerEvent::CancelTcpIpForward(address, port, tx))?;
         let allowed = rx.await.unwrap_or(false);
         if allowed {
-            session.request_success()
+            session.request_success();
         } else {
-            session.request_failure()
+            session.request_failure();
+        }
+        Ok(allowed)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let socket_path = socket_path.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.send_event(ServerHandlerEvent::StreamlocalForward(socket_path, tx))?;
+        let allowed = rx.await.unwrap_or(false);
+        if allowed {
+            session.request_success();
+        } else {
+            session.request_failure();
+        }
+        Ok(allowed)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let socket_path = socket_path.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.send_event(ServerHandlerEvent::CancelStreamlocalForward(
+            socket_path,
+            tx,
+        ))?;
+        let allowed = rx.await.unwrap_or(false);
+        if allowed {
+            session.request_success();
+        } else {
+            session.request_failure();
+        }
+        Ok(allowed)
+    }
+
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send_event(ServerHandlerEvent::AgentForward(
+            ServerChannelId(channel),
+            tx,
+        ))?;
+        let allowed = rx.await.unwrap_or(false);
+        if allowed {
+            session.request_success();
+        } else {
+            session.request_failure();
         }
         Ok(allowed)
     }

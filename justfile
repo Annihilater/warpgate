@@ -1,7 +1,10 @@
-projects := "warpgate warpgate-admin warpgate-common warpgate-db-entities warpgate-db-migrations warpgate-database-protocols warpgate-protocol-ssh warpgate-protocol-mysql warpgate-protocol-http warpgate-core warpgate-sso"
+projects := "warpgate warpgate-admin warpgate-common warpgate-db-entities warpgate-db-migrations warpgate-database-protocols warpgate-protocol-ssh warpgate-protocol-mysql warpgate-protocol-postgres warpgate-protocol-kubernetes warpgate-protocol-http warpgate-protocol-rdp warpgate-protocol-vnc warpgate-core warpgate-sso"
 
-run *ARGS:
+run *ARGS='run':
     RUST_BACKTRACE=1 cargo run --all-features -- --config config.yaml {{ARGS}}
+
+run-release *ARGS='run':
+    RUST_BACKTRACE=1 cargo run --all-features --release -- --config config.yaml {{ARGS}}
 
 fmt:
     for p in {{projects}}; do cargo fmt -p $p -v; done
@@ -10,28 +13,37 @@ fix *ARGS:
     for p in {{projects}}; do cargo fix --all-features -p $p {{ARGS}}; done
 
 clippy *ARGS:
-    for p in {{projects}}; do cargo cranky --all-features -p $p {{ARGS}}; done
+    cargo cranky --workspace --all-features {{ARGS}}
+
+bless *ARGS:
+    for p in {{projects}}; do cargo bless --manifest-path $p/Cargo.toml {{ARGS}}; done
 
 test:
     for p in {{projects}}; do cargo test --all-features -p $p; done
 
-yarn *ARGS:
-    cd warpgate-web && yarn {{ARGS}}
+npm *ARGS:
+    cd warpgate-web && npm {{ARGS}}
+
+npx *ARGS:
+    cd warpgate-web && npx {{ARGS}}
 
 migrate *ARGS:
     cargo run --all-features -p warpgate-db-migrations -- {{ARGS}}
 
-lint:
-    cd warpgate-web && yarn run lint
+lint *ARGS:
+    cd warpgate-web && npm run lint {{ARGS}}
 
 svelte-check:
-    cd warpgate-web && yarn run check
+    cd warpgate-web && npm run check
 
 openapi-all:
-    cd warpgate-web && yarn openapi:schema:admin && yarn openapi:schema:gateway && yarn openapi:client:admin && yarn openapi:client:gateway
+    cd warpgate-web && npm run openapi:schema:admin && npm run openapi:schema:gateway && npm run openapi:client:admin && npm run openapi:client:gateway
 
 openapi:
-    cd warpgate-web && yarn openapi:client:admin && yarn openapi:client:gateway
+    cd warpgate-web && npm run openapi:client:admin && npm run openapi:client:gateway
+
+config-schema:
+    cargo run -p warpgate-common --bin config-schema > config-schema.json
 
 cleanup: (fix "--allow-dirty") (clippy "--fix" "--allow-dirty") fmt svelte-check lint
 

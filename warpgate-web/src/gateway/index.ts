@@ -1,9 +1,8 @@
+import { mount } from 'svelte'
 import '../theme'
-import App from './App.svelte'
+import Root from './Root.svelte'
 
-new App({
+mount(Root, {
+    // biome-ignore lint/style/noNonNullAssertion: x
     target: document.getElementById('app')!,
 })
-
-// eslint-disable-next-line @typescript-eslint/no-useless-empty-export
-export { }

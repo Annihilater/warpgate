@@ -1,97 +1,123 @@
 <script lang="ts">
-import { api } from 'gateway/lib/api'
-import { onMount } from 'svelte'
-import logo from '../../public/assets/logo.svg'
+    import BannerModal from 'common/BannerModal.svelte'
+    import { api } from 'gateway/lib/api'
+    import { onMount } from 'svelte'
+    import logo from '../../public/assets/favicon.svg'
 
-let ready = false
-let menuVisible = false
-let dragging = false
-let savedPosition = { x: 0.1, y: 0.8 }
-let position = { x: 0.1, y: 0.8 }
-let dragStartCoords = { x: 0, y: 0 }
+    // Movement in pixels before a press turns into a drag rather than a menu toggle.
+    const DRAG_THRESHOLD = 5
 
-if (localStorage.warpgateMenuLocation) {
-    position = JSON.parse(localStorage.warpgateMenuLocation)
-    savedPosition = position
-}
+    let ready = false
+    let menuVisible = false
+    let dragging = false
+    let savedPosition = { x: 0.1, y: 0.8 }
+    let position = { x: 0.1, y: 0.8 }
+    let dragStartCoords: { x: number; y: number } | undefined
+    let externalHost: string | undefined
+    let banner = ''
+    // The embedded UI is also injected when only the banner is enabled, so the
+    // floating menu renders separately from it.
+    let showMenu = false
 
-onMount(() => {
-    ready = true
-})
-
-function drag (e: MouseEvent) {
-    if (!dragging) {
-        return
+    if (localStorage.warpgateMenuLocation) {
+        position = JSON.parse(localStorage.warpgateMenuLocation)
+        savedPosition = position
     }
-    const { x, y } = dragStartCoords
-    const { clientX, clientY } = e
-    const dx = clientX - x
-    const dy = clientY - y
-    position = {
-        x: Math.max(0, Math.min(1, savedPosition.x + dx / window.innerWidth)),
-        y: Math.max(0, Math.min(1, savedPosition.y + dy / window.innerHeight)),
+
+    onMount(async () => {
+        ready = true
+        const info = await api.getInfo()
+        banner = info.banner
+        showMenu = info.showSessionMenu
+        externalHost = `${info.externalHosts?.http ?? info.externalHost}:${info.ports.http ?? 443}`
+    })
+
+    function startDragging(e: PointerEvent) {
+        dragStartCoords = { x: e.clientX, y: e.clientY }
+        dragging = false
+        // Capture guarantees the matching pointerup/pointermove reach the icon even
+        // if the pointer leaves the window, so a release outside can't strand `dragging`.
+        ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
     }
-}
 
-function startDragging (e: MouseEvent) {
-    dragStartCoords = { x: e.clientX, y: e.clientY }
-    dragging = true
-}
+    function drag(e: PointerEvent) {
+        if (!dragStartCoords) {
+            return
+        }
+        const dx = e.clientX - dragStartCoords.x
+        const dy = e.clientY - dragStartCoords.y
+        if (!dragging && Math.hypot(dx, dy) < DRAG_THRESHOLD) {
+            return
+        }
+        dragging = true
+        position = {
+            x: Math.max(
+                0,
+                Math.min(1, savedPosition.x + dx / window.innerWidth),
+            ),
+            y: Math.max(
+                0,
+                Math.min(1, savedPosition.y + dy / window.innerHeight),
+            ),
+        }
+    }
 
-function stopDragging () {
-    dragging = false
-    savedPosition = position
-    localStorage.warpgateMenuLocation = JSON.stringify(position)
-}
+    function endDragging() {
+        if (dragging) {
+            savedPosition = position
+            localStorage.warpgateMenuLocation = JSON.stringify(position)
+        }
+        dragStartCoords = undefined
+    }
 
-function goHome () {
-    location.href = '/@warpgate'
-}
+    function goHome() {
+        if (externalHost) {
+            location.href = `https://${externalHost}/@warpgate`
+        } else {
+            location.href = '/@warpgate'
+        }
+    }
 
-async function logout () {
-    await api.logout()
-    location.reload()
-}
+    async function logout() {
+        await api.logout()
+        location.reload()
+    }
 </script>
 
-<svelte:window
-    on:mousemove|passive={drag}
-    on:mouseup={() => {
-        menuVisible = false
-        stopDragging()
-    }}
-/>
+<svelte:window on:pointerup={() => (menuVisible = false)} />
 
-<div
-    class="embedded-ui"
-    class:wg-hidden={!ready}
-    style="left: {position.x * 100}%; top: {position.y * 100}%"
->
-    <button
-        class="menu-toggle"
-        on:mouseup|stopPropagation|preventDefault={() => {
+<BannerModal {banner} />
+
+{#if showMenu}
+    <div
+        class="embedded-ui"
+        class:wg-hidden={!ready}
+        style="left: {position.x * 100}%; top: {position.y * 100}%"
+    >
+        <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+        <img
+            class="menu-toggle"
+            src={logo}
+            alt="Warpgate"
+            on:pointerdown|preventDefault={startDragging}
+            on:pointermove={drag}
+            on:pointerup|stopPropagation|preventDefault={() => {
             if (!dragging) {
                 menuVisible = !menuVisible
-            } else {
-                stopDragging()
             }
+            endDragging()
         }}
-        on:mousemove={e => {
-            if (e.buttons && !dragging) {
-                startDragging(e)
-            }
-        }}
-    >
-        <img class="logo" src={logo} alt="Warpgate" on:mousedown|preventDefault />
-    </button>
+            on:pointercancel={endDragging}
+        >
 
-    {#if menuVisible}
-        <div class="menu">
-            <button on:mouseup={goHome}>Home</button>
-            <button on:mouseup={logout}>Log out</button>
-        </div>
-    {/if}
-</div>
+        {#if menuVisible}
+            <div class="menu">
+                <button type="button" on:pointerup={goHome}>Home</button>
+                <button type="button" on:pointerup={logout}>Log out</button>
+            </div>
+        {/if}
+    </div>
+{/if}
 
 <style lang="scss">
     .embedded-ui {
@@ -102,21 +128,20 @@ async function logout () {
 
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
 
-        &.wg-hidden button {
+        &.wg-hidden > img.menu-toggle {
             opacity: 0;
         }
 
-        > button.menu-toggle {
+        > img.menu-toggle {
             transition: 0.5s ease-out opacity;
             opacity: 1;
+            cursor: pointer;
 
             width: 40px;
             height: 40px;
 
-            border-radius: 7px;
-            border: 1px solid rgba(128, 128, 128, .25);
-            background: rgba(255, 255, 255, .5);
-            backdrop-filter: blur(4px);
+            border: none;
+            padding: 0;
         }
 
         .menu {

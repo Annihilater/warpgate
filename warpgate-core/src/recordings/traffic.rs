@@ -1,31 +1,36 @@
 use std::net::Ipv4Addr;
 
-use anyhow::Result;
 use bytes::Bytes;
 use packet::Builder;
-use rand::Rng;
+use rand::RngExt;
 use tokio::time::Instant;
-use tracing::*;
+use tracing::debug;
 use warpgate_db_entities::Recording::RecordingKind;
 
-use super::writer::RecordingWriter;
-use super::Recorder;
+use super::writer::RawRecordingWriter;
+use super::{Recorder, Result};
+use crate::recordings::RecordingWriterOpener;
 
 pub struct TrafficRecorder {
-    writer: RecordingWriter,
+    writer: RawRecordingWriter,
     started_at: Instant,
 }
 
 #[derive(Debug)]
-pub struct TrafficConnectionParams {
-    pub src_addr: Ipv4Addr,
-    pub src_port: u16,
-    pub dst_addr: Ipv4Addr,
-    pub dst_port: u16,
+pub enum TrafficConnectionParams {
+    Tcp {
+        src_addr: Ipv4Addr,
+        src_port: u16,
+        dst_addr: Ipv4Addr,
+        dst_port: u16,
+    },
+    Socket {
+        socket_path: String,
+    },
 }
 
 impl TrafficRecorder {
-    pub fn connection(&mut self, params: TrafficConnectionParams) -> ConnectionRecorder {
+    pub fn connection(&self, params: TrafficConnectionParams) -> ConnectionRecorder {
         ConnectionRecorder::new(params, self.writer.clone(), self.started_at)
     }
 }
@@ -35,11 +40,11 @@ impl Recorder for TrafficRecorder {
         RecordingKind::Traffic
     }
 
-    fn new(writer: RecordingWriter) -> Self {
-        TrafficRecorder {
-            writer,
+    async fn new(opener: &RecordingWriterOpener) -> Result<Self> {
+        Ok(Self {
+            writer: opener.open_tcpdump_data().await?,
             started_at: Instant::now(),
-        }
+        })
     }
 }
 
@@ -47,22 +52,26 @@ pub struct ConnectionRecorder {
     params: TrafficConnectionParams,
     seq_tx: u32,
     seq_rx: u32,
-    writer: RecordingWriter,
+    writer: RawRecordingWriter,
     started_at: Instant,
 }
 
 impl ConnectionRecorder {
-    fn new(params: TrafficConnectionParams, writer: RecordingWriter, started_at: Instant) -> Self {
+    fn new(
+        params: TrafficConnectionParams,
+        writer: RawRecordingWriter,
+        started_at: Instant,
+    ) -> Self {
         Self {
             params,
             writer,
             started_at,
-            seq_rx: rand::thread_rng().gen(),
-            seq_tx: rand::thread_rng().gen(),
+            seq_rx: rand::rng().random(),
+            seq_tx: rand::rng().random(),
         }
     }
 
-    pub async fn write_connection_setup(&mut self) -> Result<()> {
+    pub async fn write_connection_setup(&mut self) -> anyhow::Result<()> {
         self.writer
             .write(&[
                 0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0,
@@ -76,7 +85,7 @@ impl ConnectionRecorder {
         Ok(())
     }
 
-    async fn write_packet(&mut self, data: Bytes) -> Result<()> {
+    async fn write_packet(&self, data: Bytes) -> Result<()> {
         let ms = Instant::now().duration_since(self.started_at).as_micros();
         self.writer
             .write(&u32::to_le_bytes((ms / 10u128.pow(6)) as u32))
@@ -94,7 +103,7 @@ impl ConnectionRecorder {
         Ok(())
     }
 
-    pub async fn write_rx(&mut self, data: &[u8]) -> Result<()> {
+    pub async fn write_rx(&mut self, data: &[u8]) -> anyhow::Result<()> {
         debug!("connection {:?} data rx {:?}", self.params, data);
         let seq_rx = self.seq_rx;
         self.seq_rx = self.seq_rx.wrapping_add(data.len() as u32);
@@ -113,7 +122,7 @@ impl ConnectionRecorder {
         Ok(())
     }
 
-    pub async fn write_tx(&mut self, data: &[u8]) -> Result<()> {
+    pub async fn write_tx(&mut self, data: &[u8]) -> anyhow::Result<()> {
         debug!("connection {:?} data tx {:?}", self.params, data);
         let seq_tx = self.seq_tx;
         self.seq_tx = self.seq_tx.wrapping_add(data.len() as u32);
@@ -132,49 +141,67 @@ impl ConnectionRecorder {
         Ok(())
     }
 
-    fn ip_packet_tx<F>(&self, f: F) -> Result<Bytes>
+    fn ip_packet_tx<F>(&self, f: F) -> anyhow::Result<Bytes>
     where
-        F: FnOnce(packet::ip::v4::Builder) -> Result<Bytes>,
+        F: FnOnce(packet::ip::v4::Builder) -> anyhow::Result<Bytes>,
     {
-        f(packet::ip::v4::Builder::default()
-            .protocol(packet::ip::Protocol::Tcp)?
-            .source(self.params.src_addr)?
-            .destination(self.params.dst_addr)?)
+        match self.params {
+            TrafficConnectionParams::Socket { .. } => f(packet::ip::v4::Builder::default()
+                .protocol(packet::ip::Protocol::Tcp)?
+                .source(Ipv4Addr::UNSPECIFIED)?
+                .destination(Ipv4Addr::BROADCAST)?),
+            TrafficConnectionParams::Tcp {
+                src_addr, dst_addr, ..
+            } => f(packet::ip::v4::Builder::default()
+                .protocol(packet::ip::Protocol::Tcp)?
+                .source(src_addr)?
+                .destination(dst_addr)?),
+        }
     }
 
-    fn ip_packet_rx<F>(&self, f: F) -> Result<Bytes>
+    fn ip_packet_rx<F>(&self, f: F) -> anyhow::Result<Bytes>
     where
-        F: FnOnce(packet::ip::v4::Builder) -> Result<Bytes>,
+        F: FnOnce(packet::ip::v4::Builder) -> anyhow::Result<Bytes>,
     {
-        f(packet::ip::v4::Builder::default()
-            .protocol(packet::ip::Protocol::Tcp)?
-            .source(self.params.dst_addr)?
-            .destination(self.params.src_addr)?)
+        match self.params {
+            TrafficConnectionParams::Socket { .. } => f(packet::ip::v4::Builder::default()
+                .protocol(packet::ip::Protocol::Tcp)?
+                .source(Ipv4Addr::BROADCAST)?
+                .destination(Ipv4Addr::UNSPECIFIED)?),
+            TrafficConnectionParams::Tcp {
+                src_addr, dst_addr, ..
+            } => f(packet::ip::v4::Builder::default()
+                .protocol(packet::ip::Protocol::Tcp)?
+                .source(dst_addr)?
+                .destination(src_addr)?),
+        }
     }
 
-    fn tcp_packet_tx<F>(&self, f: F) -> Result<Bytes>
+    fn tcp_packet_tx<F>(&self, f: F) -> anyhow::Result<Bytes>
     where
-        F: FnOnce(packet::tcp::Builder) -> Result<Bytes>,
+        F: FnOnce(packet::tcp::Builder) -> anyhow::Result<Bytes>,
     {
-        self.ip_packet_tx(|b| {
-            f(b.tcp()?
-                .source(self.params.src_port)?
-                .destination(self.params.dst_port)?)
+        self.ip_packet_tx(|b| match self.params {
+            TrafficConnectionParams::Socket { .. } => f(b.tcp()?.source(0)?.destination(0)?),
+            TrafficConnectionParams::Tcp {
+                src_port, dst_port, ..
+            } => f(b.tcp()?.source(src_port)?.destination(dst_port)?),
         })
     }
 
-    fn tcp_packet_rx<F>(&self, f: F) -> Result<Bytes>
+    fn tcp_packet_rx<F>(&self, f: F) -> anyhow::Result<Bytes>
     where
-        F: FnOnce(packet::tcp::Builder) -> Result<Bytes>,
+        F: FnOnce(packet::tcp::Builder) -> anyhow::Result<Bytes>,
     {
-        self.ip_packet_rx(|b| {
-            f(b.tcp()?
-                .source(self.params.dst_port)?
-                .destination(self.params.src_port)?)
+        self.ip_packet_rx(|b| match self.params {
+            TrafficConnectionParams::Socket { .. } => f(b.tcp()?.source(0)?.destination(0)?),
+            TrafficConnectionParams::Tcp {
+                src_port, dst_port, ..
+            } => f(b.tcp()?.source(dst_port)?.destination(src_port)?),
         })
     }
 
-    fn tcp_init(&mut self) -> Result<(Bytes, Bytes, Bytes)> {
+    fn tcp_init(&mut self) -> anyhow::Result<(Bytes, Bytes, Bytes)> {
         let seq_tx = self.seq_tx;
         self.seq_tx = self.seq_tx.wrapping_add(1);
         let seq_rx = self.seq_rx;

@@ -22,3 +22,20 @@ config.yaml
 __pycache__
 .pytest_cache
 dhat-heap.json
+
+# IntelliJ based IDEs
+.idea/
+/.data/
+
+
+cdx.xml
+*.cdx.xml
+
+node_modules
+
+.github
+*.md
+.env
+
+rustc-ice-*.txt
+.zed

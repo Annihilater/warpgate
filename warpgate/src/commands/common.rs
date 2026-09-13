@@ -1,7 +1,9 @@
-use tracing::*;
+use std::io::IsTerminal;
 
-pub(crate) fn assert_interactive_terminal() {
-    if !atty::is(atty::Stream::Stdin) {
+use tracing::{error, info};
+
+pub fn assert_interactive_terminal() {
+    if !std::io::stdin().is_terminal() {
         error!("Please run this command from an interactive terminal.");
         if is_docker() {
             info!("(have you forgotten `-it`?)");
@@ -10,6 +12,6 @@ pub(crate) fn assert_interactive_terminal() {
     }
 }
 
-pub(crate) fn is_docker() -> bool {
+pub fn is_docker() -> bool {
     std::env::var("DOCKER").is_ok()
 }

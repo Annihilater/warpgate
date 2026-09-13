@@ -1,19 +1,22 @@
 [package]
-edition = "2021"
-license = "Apache-2.0"
 name = "warpgate-db-entities"
-version = "0.9.1"
+version = "0.28.5"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
 
 [dependencies]
-chrono = { version = "0.4", default_features = false, features = ["serde"] }
-poem-openapi = { version = "2.0", features = ["chrono", "uuid"] }
-sea-orm = { version = "0.12.2", features = [
-    "macros",
-    "with-chrono",
-    "with-uuid",
-    "with-json",
-], default-features = false }
-serde = "1.0"
-serde_json = "1.0"
-uuid = { version = "1.2", features = ["v4", "serde"] }
-warpgate-common = { version = "*", path = "../warpgate-common" }
+bytes = { version = "1.4", default-features = false }
+ipnet.workspace = true
+poem-openapi.workspace = true
+sea-orm = { workspace = true, features = ["macros", "with-uuid", "with-json"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+warpgate-aws = { path = "../warpgate-aws" }
+warpgate-common = { path = "../warpgate-common", default-features = false }
+warpgate-ldap = { path = "../warpgate-ldap", default-features = false }
+warpgate-tls = { path = "../warpgate-tls", default-features = false }

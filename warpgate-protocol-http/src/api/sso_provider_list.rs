@@ -1,17 +1,34 @@
+use std::sync::Arc;
+
+use poem::Request;
 use poem::session::Session;
 use poem::web::{Data, Form};
-use poem::Request;
 use poem_openapi::param::Query;
 use poem_openapi::payload::{Html, Json, Response};
 use poem_openapi::{ApiResponse, Enum, Object, OpenApi};
 use serde::Deserialize;
-use tracing::*;
-use warpgate_common::auth::{AuthCredential, AuthResult};
-use warpgate_core::Services;
-use warpgate_sso::SsoInternalProviderConfig;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+use url::form_urlencoded;
+use uuid::Uuid;
+use warpgate_common::WarpgateError;
+use warpgate_common::auth::AuthCredential;
+use warpgate_common_http::auth::UnauthenticatedRequestContext;
+use warpgate_common_http::ext::construct_external_url;
+use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_common_http::warpgate_csp_with_script_nonce;
+use warpgate_core::ConfigProvider;
+use warpgate_core::auth::submit_credential;
+use warpgate_sso::{SsoClient, SsoInternalProviderConfig};
 
-use super::sso_provider_detail::{SsoContext, SSO_CONTEXT_SESSION_KEY};
-use crate::common::{authorize_session, get_auth_state_for_request};
+use super::sso_provider_detail::{SSO_CONTEXT_SESSION_KEY, SsoContext};
+use crate::SsoLoginState;
+use crate::api::auth_scheme::AuthedSession;
+use crate::api::common::{emit_unknown_authentication_failed_event, logout};
+use crate::common::{
+    SessionExt, authorize_session, get_or_create_auth_state_for_request, session_id_for_request,
+};
+use crate::session::SessionStore;
 
 pub struct Api;
 
@@ -53,11 +70,72 @@ enum ReturnToSsoPostResponse {
 #[derive(Deserialize)]
 pub struct ReturnToSsoFormData {
     pub code: Option<String>,
+    pub state: Option<String>,
+}
+
+#[derive(Object)]
+struct StartSloResponseParams {
+    url: String,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(ApiResponse)]
+enum StartSloResponse {
+    #[oai(status = 200)]
+    Ok(Json<StartSloResponseParams>),
+    #[oai(status = 400)]
+    NotInSsoSession,
+    #[oai(status = 404)]
+    NotFound,
+}
+
+#[derive(Object)]
+pub struct SsoKubernetesConfigDescription {
+    pub name: String,
+    pub label: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub client_secret: Option<String>,
+}
+
+#[derive(ApiResponse)]
+enum GetSsoKubernetesConfigsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<SsoKubernetesConfigDescription>>),
 }
 
 fn make_redirect_url(err: &str) -> String {
     error!("SSO error: {err}");
-    format!("/@warpgate?login_error={err}")
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("login_error", err)
+        .finish();
+    format!("/@warpgate?{query}")
+}
+
+/// Only site-relative paths are accepted as post-login redirect targets. An
+/// absolute URL names its own authority, so allowing one would let `?next=`
+/// carry the user to another site with a freshly authenticated session — the
+/// origin is decided by the SSO return URL, never by the caller.
+fn is_safe_redirect_target(next: &str) -> bool {
+    let Some(rest) = next.strip_prefix('/') else {
+        return false;
+    };
+    // Browsers read both `//host` and `/\host` as protocol-relative
+    // authorities, so a leading slash alone doesn't make a path site-relative.
+    !rest.starts_with(['/', '\\'])
+}
+
+/// Resolves the post-login redirect against the origin the identity provider
+/// returned the browser to. Both halves are checked before they meet here — the
+/// path by [`is_safe_redirect_target`], the origin by `construct_external_url`'s
+/// domain whitelist — so neither a crafted `next` nor a forged `Host` header can
+/// send the user off-site.
+fn post_login_redirect(next: Option<&str>, return_origin: &str) -> String {
+    let next = next
+        .filter(|next| is_safe_redirect_target(next))
+        .unwrap_or("/@warpgate#/login");
+    format!("{return_origin}{next}")
 }
 
 #[OpenApi]
@@ -69,9 +147,16 @@ impl Api {
     )]
     async fn api_get_all_sso_providers(
         &self,
-        services: Data<&Services>,
-    ) -> poem::Result<GetSsoProvidersResponse> {
-        let mut providers = services.config.lock().await.store.sso_providers.clone();
+        ctx: Data<&UnauthenticatedRequestContext>,
+    ) -> Result<GetSsoProvidersResponse, WarpgateError> {
+        let mut providers = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .sso_providers
+            .clone();
         providers.sort_by(|a, b| a.label().cmp(b.label()));
         Ok(GetSsoProvidersResponse::Ok(Json(
             providers
@@ -95,11 +180,12 @@ impl Api {
         &self,
         req: &Request,
         session: &Session,
-        services: Data<&Services>,
+        ctx: Data<&UnauthenticatedRequestContext>,
         code: Query<Option<String>>,
-    ) -> poem::Result<Response<ReturnToSsoResponse>> {
+        state: Query<Option<String>>,
+    ) -> Result<Response<ReturnToSsoResponse>, WarpgateError> {
         let url = self
-            .api_return_to_sso_get_common(req, session, services, &code)
+            .api_return_to_sso_get_common(req, session, ctx, code.as_ref(), state.as_ref())
             .await?
             .unwrap_or_else(|x| make_redirect_url(&x));
 
@@ -115,28 +201,40 @@ impl Api {
         &self,
         req: &Request,
         session: &Session,
-        services: Data<&Services>,
+        ctx: Data<&UnauthenticatedRequestContext>,
         data: Form<ReturnToSsoFormData>,
-    ) -> poem::Result<ReturnToSsoPostResponse> {
+        state: Query<Option<String>>,
+    ) -> Result<Response<ReturnToSsoPostResponse>, WarpgateError> {
         let url = self
-            .api_return_to_sso_get_common(req, session, services, &data.code)
+            .api_return_to_sso_get_common(
+                req,
+                session,
+                ctx,
+                data.code.as_ref(),
+                data.state.as_ref().or(state.as_ref()),
+            )
             .await?
             .unwrap_or_else(|x| make_redirect_url(&x));
-        let serialized_url =
-            serde_json::to_string(&url).map_err(poem::error::InternalServerError)?;
-        Ok(ReturnToSsoPostResponse::Redirect(
+
+        let csp_nonce = Uuid::new_v4().simple().to_string();
+        let serialized_url = html_escape::encode_script(&serde_json::to_string(&url)?).to_string();
+        let attr_url = html_escape::encode_double_quoted_attribute(&url);
+        let text_url = html_escape::encode_text(&url);
+        Ok(Response::new(ReturnToSsoPostResponse::Redirect(
             poem_openapi::payload::Html(format!(
                 "<!doctype html>\n
                 <html>
-                    <script>
-                        location.href = {serialized_url};
-                    </script>
+                    <script nonce=\"{csp_nonce}\">location.href = {serialized_url};</script>
                     <body>
-                        Redirecting to <a href='{url}'>{url}</a>...
+                        Redirecting to <a href=\"{attr_url}\">{text_url}</a>...
                     </body>
                 </html>
             "
             )),
+        ))
+        .header(
+            "content-security-policy",
+            warpgate_csp_with_script_nonce(&csp_nonce),
         ))
     }
 
@@ -144,109 +242,295 @@ impl Api {
         &self,
         req: &Request,
         session: &Session,
-        services: Data<&Services>,
-        code: &Option<String>,
-    ) -> poem::Result<Result<String, String>> {
+        ctx: Data<&UnauthenticatedRequestContext>,
+        code: Option<&String>,
+        state: Option<&String>,
+    ) -> Result<Result<String, String>, WarpgateError> {
+        // pull services locally for convenience
+        let services = ctx.services();
+        let client_ip = get_client_ip_addr(req, services).await;
         let Some(context) = session.get::<SsoContext>(SSO_CONTEXT_SESSION_KEY) else {
             return Ok(Err("Not in an active SSO process".to_string()));
         };
 
-        let Some(ref code) = *code else {
+        let Some(code) = code else {
             return Ok(Err(
                 "No authorization code in the return URL request".to_string()
             ));
         };
 
+        let Some(state) = state else {
+            return Ok(Err(
+                "No SSO state parameter in the return request".to_string()
+            ));
+        };
+
+        if !context.request.verify_state(state) {
+            return Ok(Err("Invalid SSO state parameter".to_string()));
+        }
+
         let response = context
             .request
             .verify_code((*code).clone())
             .await
-            .map_err(poem::error::InternalServerError)?;
+            .inspect_err(|e| {
+                warn!("Failed to verify SSO code: {e:?}");
+            })?;
 
         if !response.email_verified.unwrap_or(true) {
+            error!(
+                "SSO login attempt with an unverified email: {:?}",
+                response.email
+            );
+            error!(
+                "The SSO provider did provide an email_verified claim, and it is false. Since the provider provides this claim, Warpgate requires the email to be verified."
+            );
             return Ok(Err("The SSO account's e-mail is not verified".to_string()));
         }
 
-        let Some(email) = response.email else {
+        let Some(ref email) = response.email else {
             return Ok(Err("No e-mail information in the SSO response".to_string()));
         };
 
         info!("SSO login as {email}");
 
-        let provider = context.provider.clone();
+        let providers_config = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .sso_providers
+            .clone();
+        let mut iter = providers_config.iter();
+        let Some(provider_config) = iter.find(|x| x.name == context.provider) else {
+            return Ok(Err(format!("No provider matching {}", context.provider)));
+        };
+
         let cred = AuthCredential::Sso {
-            provider: context.provider,
+            provider: context.provider.clone(),
             email: email.clone(),
         };
 
         let username = services
             .config_provider
-            .lock()
-            .await
-            .username_for_sso_credential(&cred)
+            .username_for_sso_credential(
+                &cred,
+                response.preferred_username.clone(),
+                provider_config.clone(),
+            )
             .await?;
         let Some(username) = username else {
+            let session_id = session_id_for_request(req, &ctx).await?;
+            emit_unknown_authentication_failed_event(
+                session_id,
+                client_ip,
+                email,
+                &cred.readable_description(),
+                "unknown user",
+            );
             return Ok(Err(format!("No user matching {email}")));
         };
 
-        let mut auth_state_store = services.auth_state_store.lock().await;
-        let state_arc =
-            get_auth_state_for_request(&username, session, &mut auth_state_store).await?;
+        let state_arc = match get_or_create_auth_state_for_request(req, &username, &ctx, None).await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                if matches!(e, WarpgateError::IpAddrNotAllowed(..)) {
+                    let session_id = session_id_for_request(req, &ctx).await?;
+                    emit_unknown_authentication_failed_event(
+                        session_id,
+                        client_ip,
+                        &username,
+                        &cred.readable_description(),
+                        "IP address not allowed",
+                    );
+                    return Ok(Err(
+                        "Login denied: your IP address is not in the allowed range for this user"
+                            .to_string(),
+                    ));
+                }
+                return Err(e);
+            }
+        };
 
         let mut state = state_arc.lock().await;
-        let mut cp = services.config_provider.lock().await;
 
-        if state.username() != username {
+        let outcome = submit_credential(
+            &mut state,
+            cred,
+            ctx.services().config_provider.as_ref(),
+            &ctx.services().login_protection,
+        )
+        .await?;
+
+        if !outcome.is_valid() {
+            crate::api::auth::record_failed_login_attempt(services, client_ip, &username, "sso")
+                .await;
             return Ok(Err(format!(
-                "Incorrect account for SSO authentication ({username})"
+                "Failed to validate SSO credential for {username}"
             )));
         }
 
-        if cp.validate_credential(&username, &cred).await? {
-            state.add_valid_credential(cred);
+        if let Ok(user_info) = outcome.into_accepted() {
+            authorize_session(req, &ctx, user_info).await?;
+            state.emit_authenticated_event_once();
+            if let Some(ip) = client_ip {
+                let _ = services
+                    .login_protection
+                    .clear_failed_attempts(&ip, &username)
+                    .await;
+            }
+            drop(state);
+            session.set_sso_login_state(SsoLoginState {
+                provider: context.provider,
+                token: response.id_token.clone(),
+                supports_single_logout: context.supports_single_logout,
+            });
         }
 
-        if let AuthResult::Accepted { username } = state.verify() {
-            auth_state_store.complete(state.id()).await;
-            authorize_session(req, username).await?;
-        }
+        warpgate_core::resolve_and_map_sso_user(
+            services.config_provider.as_ref(),
+            provider_config,
+            &response,
+        )
+        .await?;
 
-        let providers_config = services.config.lock().await.store.sso_providers.clone();
-        let mut iter = providers_config.iter();
-        let Some(provider_config) = iter.find(|x| x.name == provider) else {
-            return Ok(Err(format!("No provider matching {provider}")));
+        Ok(Ok(post_login_redirect(
+            context.next_url.as_deref(),
+            &context.return_origin,
+        )))
+    }
+
+    #[oai(
+        path = "/sso/logout",
+        method = "get",
+        operation_id = "initiate_sso_logout"
+    )]
+    async fn api_start_slo(
+        &self,
+        req: &Request,
+        session: &Session,
+        ctx: Data<&UnauthenticatedRequestContext>,
+        session_middleware: Data<&Arc<Mutex<SessionStore>>>,
+    ) -> Result<StartSloResponse, WarpgateError> {
+        let Some(state) = session.get_sso_login_state() else {
+            return Ok(StartSloResponse::NotInSsoSession);
         };
 
-        let mappings = provider_config.provider.role_mappings();
-        if let Some(remote_groups) = response.groups {
-            // If mappings is not set, all groups are subject to sync
-            // and names won't be remapped
-            let managed_role_names = mappings
-                .as_ref()
-                .map(|m| m.iter().map(|x| x.1.clone()).collect::<Vec<_>>());
+        let config = ctx.services().config.lock().await;
 
-            let active_role_names: Vec<_> = remote_groups
-                .iter()
-                .filter_map({
-                    |r| {
-                        if let Some(ref mappings) = mappings {
-                            mappings.get(r).cloned()
-                        } else {
-                            Some(r.clone())
-                        }
-                    }
+        let return_url = construct_external_url(Some(req), &config, None).await?;
+        debug!("Return URL: {}", &return_url);
+
+        let Some(provider_config) = config
+            .store
+            .sso_providers
+            .iter()
+            .find(|p| p.name == state.provider)
+        else {
+            return Ok(StartSloResponse::NotFound);
+        };
+
+        let client = SsoClient::new(provider_config.provider.clone())?;
+        let logout_url = client.logout(state.token, return_url).await?;
+
+        logout(session, &mut *session_middleware.lock().await);
+
+        Ok(StartSloResponse::Ok(Json(StartSloResponseParams {
+            url: logout_url.to_string(),
+        })))
+    }
+
+    #[oai(
+        path = "/sso/kubernetes-configs",
+        method = "get",
+        operation_id = "get_sso_kubernetes_configs"
+    )]
+    async fn api_get_sso_kubernetes_configs(
+        &self,
+        ctx: AuthedSession,
+    ) -> Result<GetSsoKubernetesConfigsResponse, WarpgateError> {
+        let mut providers = ctx
+            .services()
+            .config
+            .lock()
+            .await
+            .store
+            .sso_providers
+            .clone();
+        providers.sort_by(|a, b| a.label().cmp(b.label()));
+        let configs = providers
+            .iter()
+            .filter_map(|p| {
+                let k = p.kubernetes.as_ref()?;
+                let issuer_url = p.provider.issuer_url().ok()?;
+                Some(SsoKubernetesConfigDescription {
+                    name: p.name.clone(),
+                    label: p.label().to_string(),
+                    issuer_url: issuer_url.to_string(),
+                    client_id: k.client_id.clone(),
+                    scopes: k.scopes_or_default(),
+                    client_secret: k.client_secret.clone(),
                 })
-                .collect();
+            })
+            .collect();
+        Ok(GetSsoKubernetesConfigsResponse::Ok(Json(configs)))
+    }
+}
 
-            debug!("SSO role mappings for {username}: active={active_role_names:?}, managed={managed_role_names:?}");
-            cp.apply_sso_role_mappings(&username, managed_role_names, active_role_names)
-                .await?;
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_redirect_target, make_redirect_url, post_login_redirect};
+
+    #[test]
+    fn error_redirect_is_site_relative_and_escaped() {
+        assert_eq!(
+            make_redirect_url("No user matching a&b@example.com"),
+            "/@warpgate?login_error=No+user+matching+a%26b%40example.com"
+        );
+    }
+
+    #[test]
+    fn accepts_relative_paths() {
+        assert!(is_safe_redirect_target("/@warpgate#/login"));
+        assert!(is_safe_redirect_target("/foo/bar?x=1"));
+    }
+
+    #[test]
+    fn rejects_anything_carrying_its_own_authority() {
+        assert!(!is_safe_redirect_target("javascript:alert(1)"));
+        assert!(!is_safe_redirect_target("data:text/html,<script>"));
+        assert!(!is_safe_redirect_target("//evil.com"));
+        assert!(!is_safe_redirect_target("/\\evil.com"));
+        assert!(!is_safe_redirect_target("ftp://example.com"));
+        // Absolute http(s) URLs are rejected too: the origin comes from the SSO
+        // return URL, never from the caller.
+        assert!(!is_safe_redirect_target("https://evil.com/path"));
+        assert!(!is_safe_redirect_target("http://evil.com"));
+    }
+
+    #[test]
+    fn redirect_is_resolved_against_the_return_origin() {
+        assert_eq!(
+            post_login_redirect(Some("/foo?x=1"), "https://gate.example:8888"),
+            "https://gate.example:8888/foo?x=1"
+        );
+    }
+
+    #[test]
+    fn rejected_targets_fall_back_to_the_login_page_on_the_return_origin() {
+        for next in [
+            Some("https://evil.com/path"),
+            Some("//evil.com"),
+            Some("javascript:alert(1)"),
+            None,
+        ] {
+            assert_eq!(
+                post_login_redirect(next, "https://gate.example"),
+                "https://gate.example/@warpgate#/login",
+                "{next:?} must not leave the return origin"
+            );
         }
-
-        Ok(Ok(context
-            .next_url
-            .as_deref()
-            .unwrap_or("/@warpgate#/login")
-            .to_owned()))
     }
 }

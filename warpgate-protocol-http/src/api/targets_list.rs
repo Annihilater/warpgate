@@ -1,22 +1,37 @@
-use futures::{stream, StreamExt};
-use poem::web::Data;
+use std::collections::HashMap;
+
 use poem_openapi::param::Query;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
+use sea_orm::EntityTrait;
 use serde::Serialize;
-use warpgate_common::TargetOptions;
-use warpgate_core::Services;
-use warpgate_db_entities::Target;
+use uuid::Uuid;
+use warpgate_common::{Target as TargetConfig, WarpgateError};
+use warpgate_common_http::{RequestAuthorization, SessionAuthorization};
+use warpgate_core::ConfigProvider;
+use warpgate_db_entities::TargetGroup::BootstrapThemeColor;
+use warpgate_db_entities::{Target, TargetGroup};
 
-use crate::common::{endpoint_auth, SessionAuthorization};
+use crate::api::auth_scheme::AuthedSession;
 
 pub struct Api;
 
 #[derive(Debug, Serialize, Clone, Object)]
-pub struct TargetSnapshot {
+pub struct GroupInfo {
+    pub id: uuid::Uuid,
     pub name: String,
+    pub color: Option<BootstrapThemeColor>,
+}
+
+#[derive(Debug, Serialize, Clone, Object)]
+pub struct TargetSnapshot {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
     pub kind: Target::TargetKind,
     pub external_host: Option<String>,
+    pub group: Option<GroupInfo>,
+    pub default_database_name: Option<String>,
 }
 
 #[derive(ApiResponse)]
@@ -27,69 +42,75 @@ enum GetTargetsResponse {
 
 #[OpenApi]
 impl Api {
-    #[oai(
-        path = "/targets",
-        method = "get",
-        operation_id = "get_targets",
-        transform = "endpoint_auth"
-    )]
+    #[oai(path = "/targets", method = "get", operation_id = "get_targets")]
     async fn api_get_all_targets(
         &self,
-        services: Data<&Services>,
-        auth: Data<&SessionAuthorization>,
+        ctx: AuthedSession,
         search: Query<Option<String>>,
-    ) -> poem::Result<GetTargetsResponse> {
-        let mut targets = {
-            let mut config_provider = services.config_provider.lock().await;
-            config_provider.list_targets().await?
-        };
+    ) -> Result<GetTargetsResponse, WarpgateError> {
+        // Fetch target groups for group information
+        let services = ctx.services();
+        let groups: Vec<TargetGroup::Model> = {
+            let db = &services.db;
+            TargetGroup::Entity::find().all(db).await
+        }?;
+
+        let group_map: HashMap<uuid::Uuid, &TargetGroup::Model> =
+            groups.iter().map(|g| (g.id, g)).collect();
+
+        let mut targets: Vec<TargetConfig> = services.config_provider.list_targets().await?;
 
         if let Some(ref search) = *search {
-            targets.retain(|t| t.name.contains(search))
+            let search = search.to_lowercase();
+            targets.retain(|t| {
+                let group = t.group_id.and_then(|group_id| group_map.get(&group_id));
+                t.name.to_lowercase().contains(&search)
+                    || group.is_some_and(|g| g.name.to_lowercase().contains(&search))
+            });
         }
 
-        let mut targets = stream::iter(targets)
-            .filter(|t| {
-                let services = services.clone();
-                let auth = auth.clone();
-                let name = t.name.clone();
-                async move {
-                    match auth {
-                        SessionAuthorization::Ticket { target_name, .. } => target_name == name,
-                        SessionAuthorization::User(_) => {
-                            let mut config_provider = services.config_provider.lock().await;
+        match &ctx.auth {
+            RequestAuthorization::Session(SessionAuthorization::Ticket { target_id, .. }) => {
+                targets.retain(|t| t.id == *target_id);
+            }
+            RequestAuthorization::AdminToken => {
+                targets.clear();
+            }
+            auth => {
+                let authorized_ids = services
+                    .config_provider
+                    .authorized_target_ids(auth.user_id())
+                    .await?;
+                targets.retain(|t| authorized_ids.contains(&t.id));
+            }
+        }
 
-                            matches!(
-                                config_provider
-                                    .authorize_target(auth.username(), &name)
-                                    .await,
-                                Ok(true)
-                            )
-                        }
-                    }
+        let result: Vec<TargetSnapshot> = targets
+            .into_iter()
+            .map(|t| {
+                let group = t.group_id.and_then(|group_id| {
+                    group_map.get(&group_id).map(|group| GroupInfo {
+                        id: group.id,
+                        name: group.name.clone(),
+                        color: group.color.clone(),
+                    })
+                });
+
+                TargetSnapshot {
+                    id: t.id,
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    kind: (&t.options).into(),
+                    external_host: t.options.external_host().map(ToString::to_string),
+                    default_database_name: t
+                        .options
+                        .default_database_name()
+                        .map(ToString::to_string),
+                    group,
                 }
             })
-            .collect::<Vec<_>>()
-            .await;
-        targets.sort_by(|a, b| a.name.cmp(&b.name));
+            .collect();
 
-        Ok(GetTargetsResponse::Ok(Json(
-            targets
-                .into_iter()
-                .map(|t| TargetSnapshot {
-                    name: t.name.clone(),
-                    kind: match t.options {
-                        TargetOptions::Ssh(_) => Target::TargetKind::Ssh,
-                        TargetOptions::Http(_) => Target::TargetKind::Http,
-                        TargetOptions::MySql(_) => Target::TargetKind::MySql,
-                        TargetOptions::WebAdmin(_) => Target::TargetKind::WebAdmin,
-                    },
-                    external_host: match t.options {
-                        TargetOptions::Http(ref opt) => opt.external_host.clone(),
-                        _ => None,
-                    },
-                })
-                .collect(),
-        )))
+        Ok(GetTargetsResponse::Ok(Json(result)))
     }
 }

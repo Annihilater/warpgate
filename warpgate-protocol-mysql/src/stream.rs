@@ -1,12 +1,11 @@
 use bytes::{Bytes, BytesMut};
-use mysql_common::proto::codec::error::PacketCodecError;
+use mysql_common::constants::DEFAULT_MAX_ALLOWED_PACKET;
 use mysql_common::proto::codec::PacketCodec;
+use mysql_common::proto::codec::error::PacketCodecError;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tracing::*;
+use tracing::trace;
 use warpgate_database_protocols::io::Encode;
-
-use crate::tls::{MaybeTlsStream, MaybeTlsStreamError, UpgradableStream};
+use warpgate_tls::{MaybeTlsStream, MaybeTlsStreamError, UpgradableStream};
 
 #[derive(thiserror::Error, Debug)]
 pub enum MySqlStreamError {
@@ -16,23 +15,23 @@ pub enum MySqlStreamError {
     Io(#[from] std::io::Error),
 }
 
-pub struct MySqlStream<TS>
+pub struct MySqlStream<S, TS>
 where
-    TcpStream: UpgradableStream<TS>,
+    S: UpgradableStream<TS> + AsyncRead + AsyncWrite + Unpin,
     TS: AsyncRead + AsyncWrite + Unpin,
 {
-    stream: MaybeTlsStream<TcpStream, TS>,
+    stream: MaybeTlsStream<S, TS>,
     codec: PacketCodec,
     inbound_buffer: BytesMut,
     outbound_buffer: BytesMut,
 }
 
-impl<TS> MySqlStream<TS>
+impl<S, TS> MySqlStream<S, TS>
 where
-    TcpStream: UpgradableStream<TS>,
+    S: UpgradableStream<TS> + AsyncRead + AsyncWrite + Unpin,
     TS: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: S) -> Self {
         Self {
             stream: MaybeTlsStream::new(stream),
             codec: PacketCodec::default(),
@@ -82,19 +81,35 @@ where
         self.codec.reset_seq_id();
     }
 
+    /// Raises the codec's packet-size ceiling to the value negotiated in the
+    /// handshake, never below MySQL's default. Without this the proxy keeps the
+    /// 4 MiB `PacketCodec` default and aborts mid-stream on any larger packet
+    /// (a wide row, a large BLOB) even though both peers agreed on more.
+    pub fn set_max_packet_size(&mut self, negotiated: u32) {
+        self.codec.max_allowed_packet = effective_max_packet(negotiated);
+    }
+
     pub async fn upgrade(
         mut self,
-        config: <TcpStream as UpgradableStream<TS>>::UpgradeConfig,
+        config: <S as UpgradableStream<TS>>::UpgradeConfig,
     ) -> Result<Self, MaybeTlsStreamError> {
-        self.stream = self.stream.upgrade(config).await?;
+        // Any data already read off the socket past the last decoded packet
+        // is the beginning of the TLS handshake (e.g. clients are allowed
+        // to send their ClientHello right behind the SSLRequest packet) and
+        // has to be replayed into the TLS layer (#1421).
+        let leftover = std::mem::take(&mut self.inbound_buffer).freeze();
+        self.stream = self.stream.upgrade(config, leftover).await?;
         Ok(self)
     }
 
-    pub fn is_tls(&self) -> bool {
+    pub const fn is_tls(&self) -> bool {
         match self.stream {
-            MaybeTlsStream::Raw(_) => false,
             MaybeTlsStream::Tls(_) => true,
-            MaybeTlsStream::Upgrading => false,
+            MaybeTlsStream::Raw(_) | MaybeTlsStream::Upgrading => false,
         }
     }
+}
+
+fn effective_max_packet(negotiated: u32) -> usize {
+    (negotiated as usize).max(DEFAULT_MAX_ALLOWED_PACKET)
 }

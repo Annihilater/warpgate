@@ -1,14 +1,10 @@
-use std::sync::Arc;
-
-use russh_keys::key::PublicKey;
-use russh_keys::PublicKeyBase64;
+use russh::keys::{PublicKey, PublicKeyBase64};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use warpgate_db_entities::KnownHost;
 
 pub struct KnownHosts {
-    db: Arc<Mutex<DatabaseConnection>>,
+    db: DatabaseConnection,
 }
 
 pub enum KnownHostValidationResult {
@@ -21,22 +17,22 @@ pub enum KnownHostValidationResult {
 }
 
 impl KnownHosts {
-    pub fn new(db: &Arc<Mutex<DatabaseConnection>>) -> Self {
+    pub fn new(db: &DatabaseConnection) -> Self {
         Self { db: db.clone() }
     }
 
     pub async fn validate(
-        &mut self,
+        &self,
         host: &str,
         port: u16,
         key: &PublicKey,
     ) -> Result<KnownHostValidationResult, sea_orm::DbErr> {
-        let db = self.db.lock().await;
+        let db = &self.db;
         let entries = KnownHost::Entity::find()
             .filter(KnownHost::Column::Host.eq(host))
             .filter(KnownHost::Column::Port.eq(port))
-            .filter(KnownHost::Column::KeyType.eq(key.name()))
-            .all(&*db)
+            .filter(KnownHost::Column::KeyType.eq(key.algorithm().as_str()))
+            .all(db)
             .await?;
 
         let key_base64 = key.public_key_base64();
@@ -53,7 +49,7 @@ impl KnownHosts {
     }
 
     pub async fn trust(
-        &mut self,
+        &self,
         host: &str,
         port: u16,
         key: &PublicKey,
@@ -64,12 +60,12 @@ impl KnownHosts {
             id: Set(Uuid::new_v4()),
             host: Set(host.to_owned()),
             port: Set(port.into()),
-            key_type: Set(key.name().to_owned()),
+            key_type: Set(key.algorithm().to_string()),
             key_base64: Set(key.public_key_base64()),
         };
 
-        let db = self.db.lock().await;
-        values.insert(&*db).await?;
+        let db = &self.db;
+        values.insert(db).await?;
 
         Ok(())
     }

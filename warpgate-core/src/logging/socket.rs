@@ -1,9 +1,10 @@
 use bytes::BytesMut;
-use chrono::Local;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::net::UnixDatagram;
-use tracing::*;
-use tracing_subscriber::registry::LookupSpan;
+use tracing::{Subscriber, error};
 use tracing_subscriber::Layer;
+use tracing_subscriber::registry::LookupSpan;
 use warpgate_common::WarpgateConfig;
 
 use super::layer::ValuesLogLayer;
@@ -28,11 +29,19 @@ where
 
     let got_socket = socket.is_some();
 
-    let layer = ValuesLogLayer::new(move |mut values| {
+    let layer = ValuesLogLayer::new(move |mut values, target| {
         if !got_socket || values.contains_key(&SKIP_KEY) {
             return;
         }
-        values.insert("timestamp", Local::now().to_rfc3339());
+        values.insert("target", target);
+        #[allow(clippy::unwrap_used, reason = "never fails")]
+        values.insert(
+            "timestamp",
+            OffsetDateTime::now_local()
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap(),
+        );
         let _ = tx.try_send(values);
     });
 

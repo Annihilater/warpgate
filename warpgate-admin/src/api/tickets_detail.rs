@@ -1,11 +1,13 @@
-use std::sync::Arc;
-
-use poem::web::Data;
 use poem_openapi::param::Path;
 use poem_openapi::{ApiResponse, OpenApi};
-use sea_orm::{DatabaseConnection, EntityTrait, ModelTrait};
-use tokio::sync::Mutex;
+use sea_orm::EntityTrait;
 use uuid::Uuid;
+use warpgate_common::{AdminPermission, WarpgateError};
+use warpgate_core::logging::AuditEvent;
+use warpgate_core::ticket_requests::delete_ticket;
+use warpgate_db_entities::{Target, User};
+
+use super::AdminContext;
 
 pub struct Api;
 
@@ -27,26 +29,35 @@ impl Api {
     )]
     async fn api_delete_ticket(
         &self,
-        db: Data<&Arc<Mutex<DatabaseConnection>>>,
+        admin: AdminContext,
         id: Path<Uuid>,
-    ) -> poem::Result<DeleteTicketResponse> {
+    ) -> Result<DeleteTicketResponse, WarpgateError> {
         use warpgate_db_entities::Ticket;
-        let db = db.lock().await;
 
-        let ticket = Ticket::Entity::find_by_id(id.0)
-            .one(&*db)
-            .await
-            .map_err(poem::error::InternalServerError)?;
+        admin.require(AdminPermission::TicketsDelete)?;
 
-        match ticket {
-            Some(ticket) => {
-                ticket
-                    .delete(&*db)
-                    .await
-                    .map_err(poem::error::InternalServerError)?;
-                Ok(DeleteTicketResponse::Deleted)
+        let db = &admin.services().db;
+
+        let Some(ticket) = Ticket::Entity::find_by_id(id.0).one(db).await? else {
+            return Ok(DeleteTicketResponse::NotFound);
+        };
+
+        let user = User::Entity::find_by_id(ticket.user_id).one(db).await?;
+
+        let target = Target::Entity::find_by_id(ticket.target_id).one(db).await?;
+
+        if let (Some(user), Some(target)) = (user, target) {
+            AuditEvent::TicketDeleted {
+                ticket_id: ticket.id,
+                user_id: user.id,
+                username: user.username,
+                target: target.name,
+                actor_user_id: admin.auth.user_id(),
             }
-            None => Ok(DeleteTicketResponse::NotFound),
+            .emit();
         }
+
+        delete_ticket(db, ticket.id).await?;
+        Ok(DeleteTicketResponse::Deleted)
     }
 }

@@ -1,16 +1,23 @@
 use anyhow::Result;
-use warpgate_protocol_ssh::helpers::PublicKeyAsOpenSSH;
+use warpgate_common::GlobalParams;
+use warpgate_core::db::connect_to_db_and_migrate;
+use warpgate_db_entities::SshClientKey;
 
 use crate::config::load_config;
 
-pub(crate) async fn command(cli: &crate::Cli) -> Result<()> {
-    let config = load_config(&cli.config, true)?;
-    let keys = warpgate_protocol_ssh::load_client_keys(&config)?;
+pub async fn command(params: &GlobalParams) -> Result<()> {
+    let config = load_config(params, true)?;
+    let db = connect_to_db_and_migrate(&config, params).await?;
+    warpgate_protocol_ssh::ensure_client_keys(&db, &config.store.ssh.keys_path(params)).await?;
+
+    let keys = SshClientKey::Entity::find_ordered().all(&db).await?;
+
     println!("Warpgate SSH client keys:");
     println!("(add these to your target's authorized_keys file)");
     println!();
     for key in keys {
-        println!("{}", key.as_openssh());
+        let default = if key.is_default { " (default)" } else { "" };
+        println!("{} {}{default}", key.public_key, key.label);
     }
     Ok(())
 }

@@ -1,16 +1,28 @@
 use anyhow::Result;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{Error, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use data_encoding::HEXLOWER;
-use password_hash::errors::Error;
-use rand::Rng;
+use rand::RngExt;
+use sha2::{Digest, Sha256};
 
 use crate::Secret;
 
 pub fn hash_password(password: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
+    let argon2 = if std::env::var("WARPGATE_UNDER_TEST")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        Argon2::default()
+    } else {
+        #[allow(clippy::unwrap_used, reason = "tests")]
+        Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(1000, 1, 1, None).unwrap(),
+        )
+    };
     // Only panics for invalid hash parameters
     #[allow(clippy::unwrap_used)]
     argon2
@@ -34,6 +46,11 @@ pub fn verify_password_hash(password: &str, hash: &str) -> Result<bool> {
 
 pub fn generate_ticket_secret() -> Secret<String> {
     let mut bytes = [0; 32];
-    rand::thread_rng().fill(&mut bytes[..]);
+    rand::rng().fill(&mut bytes[..]);
     Secret::new(HEXLOWER.encode(&bytes))
+}
+
+/// Deterministic hash for high-entropy secrets (tokens/tickets)
+pub fn hash_secret(secret: &str) -> String {
+    HEXLOWER.encode(&Sha256::digest(secret.as_bytes()))
 }

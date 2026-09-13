@@ -1,7 +1,7 @@
 use sea_orm::Schema;
 use sea_orm_migration::prelude::*;
 
-pub(crate) mod role {
+pub mod role {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
@@ -19,12 +19,12 @@ pub(crate) mod role {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-mod target {
+pub mod target {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
     #[derive(Debug, PartialEq, Eq, Clone, EnumIter, DeriveActiveEnum)]
-    #[sea_orm(rs_type = "String", db_type = "String(Some(16))")]
+    #[sea_orm(rs_type = "String", db_type = "String(StringLen::N(16))")]
     pub enum TargetKind {
         #[sea_orm(string_value = "http")]
         Http,
@@ -34,15 +34,6 @@ mod target {
         Ssh,
         #[sea_orm(string_value = "web_admin")]
         WebAdmin,
-    }
-
-    #[derive(Debug, PartialEq, Eq, Clone, EnumIter, DeriveActiveEnum)]
-    #[sea_orm(rs_type = "String", db_type = "String(Some(16))")]
-    pub enum SshAuthKind {
-        #[sea_orm(string_value = "password")]
-        Password,
-        #[sea_orm(string_value = "publickey")]
-        PublicKey,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -71,7 +62,7 @@ mod target {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-mod target_role_assignment {
+pub mod target_role_assignment {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 

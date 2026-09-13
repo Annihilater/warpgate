@@ -1,12 +1,16 @@
 <script lang="ts">
-import { Tls, TlsMode } from 'admin/lib/api'
-import { FormGroup, Input } from 'sveltestrap'
+    import { FormGroup, Input } from '@sveltestrap/sveltestrap'
+    import { type Tls, TlsMode } from 'admin/lib/api'
 
-export let value: Tls
+    interface Props {
+        value: Tls
+        class?: string
+    }
 
+    let { value = $bindable(), class: className = '' }: Props = $props()
 </script>
 
-<div class="row align-items-center">
+<div class="row align-items-center {className}">
     <div class="col">
         <FormGroup floating label="TLS mode">
             <select bind:value={value.mode} class="form-control">
@@ -18,7 +22,12 @@ export let value: Tls
     </div>
     {#if value.mode !== TlsMode.Disabled}
         <div class="col mb-3">
-            <Input class="ms-3" type="switch" label="Verify certificate" bind:checked={value.verify} />
+            <Input
+                class="ms-3"
+                type="switch"
+                label="Verify certificate"
+                bind:checked={value.verify}
+            />
         </div>
     {/if}
 </div>

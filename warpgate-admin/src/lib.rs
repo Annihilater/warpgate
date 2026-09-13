@@ -1,33 +1,29 @@
-#![feature(decl_macro, proc_macro_hygiene)]
-mod api;
+pub mod api;
+pub mod approvals;
+pub use api::common::require_admin_permission;
+use poem::http::header::CONTENT_SECURITY_POLICY;
+use poem::middleware::SetHeader;
 use poem::{EndpointExt, IntoEndpoint, Route};
 use poem_openapi::OpenApiService;
-use warpgate_core::Services;
+use warpgate_common::version::warpgate_version;
+use warpgate_common_http::WARPGATE_PLAYGROUND_CSP;
 
-pub fn admin_api_app(services: &Services) -> impl IntoEndpoint {
-    let api_service = OpenApiService::new(
-        crate::api::get(),
-        "Warpgate Web Admin",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .server("/@warpgate/admin/api");
+pub fn admin_api_app() -> impl IntoEndpoint {
+    let api_service =
+        OpenApiService::new(crate::api::get(), "Warpgate admin API", warpgate_version())
+            .server("/@warpgate/admin/api");
 
-    let ui = api_service.swagger_ui();
+    // Stoplight Elements loads its assets from unpkg.com; the gateway's strict
+    // default CSP would otherwise blank the playground.
+    let ui = api_service
+        .stoplight_elements()
+        .with(SetHeader::new().overriding(CONTENT_SECURITY_POLICY, WARPGATE_PLAYGROUND_CSP));
     let spec = api_service.spec_endpoint();
-    let db = services.db.clone();
-    let config = services.config.clone();
-    let config_provider = services.config_provider.clone();
-    let recordings = services.recordings.clone();
-    let state = services.state.clone();
 
     Route::new()
         .nest("", api_service)
-        .nest("/swagger", ui)
+        .nest("/playground", ui)
         .nest("/openapi.json", spec)
-        .at(
-            "/recordings/:id/cast",
-            crate::api::recordings_detail::api_get_recording_cast,
-        )
         .at(
             "/recordings/:id/stream",
             crate::api::recordings_detail::api_get_recording_stream,
@@ -37,12 +33,19 @@ pub fn admin_api_app(services: &Services) -> impl IntoEndpoint {
             crate::api::recordings_detail::api_get_recording_tcpdump,
         )
         .at(
+            "/recordings/:id/data",
+            crate::api::recordings_detail::api_get_recording_data,
+        )
+        .at(
+            "/recordings/:id/index",
+            crate::api::recordings_detail::api_get_recording_index,
+        )
+        .at(
             "/sessions/changes",
             crate::api::sessions_list::api_get_sessions_changes_stream,
         )
-        .data(db)
-        .data(config_provider)
-        .data(state)
-        .data(recordings)
-        .data(config)
+        .at(
+            "/session-approvals/changes",
+            crate::api::session_approvals::api_get_session_approvals_stream,
+        )
 }

@@ -1,124 +1,204 @@
 <script lang="ts">
-import { faSignOut } from '@fortawesome/free-solid-svg-icons'
-import { api } from 'gateway/lib/api'
-import { serverInfo, reloadServerInfo } from 'gateway/lib/store'
-import Fa from 'svelte-fa'
+    import { faGithub } from '@fortawesome/free-brands-svg-icons'
+    import { faBriefcase } from '@fortawesome/free-solid-svg-icons'
+    import { Alert } from '@sveltestrap/sveltestrap'
+    import AuthBar from 'common/AuthBar.svelte'
+    import Brand from 'common/Brand.svelte'
+    import Loadable from 'common/Loadable.svelte'
+    import Redirect from 'common/Redirect.svelte'
+    import RequestsButton from 'common/RequestsButton.svelte'
+    import ThemeSwitcher from 'common/ThemeSwitcher.svelte'
+    import { reloadServerInfo, serverInfo } from 'gateway/lib/store'
+    import { get } from 'svelte/store'
+    import Fa from 'svelte-fa'
+    import Router, {
+        link,
+        push,
+        type RouteDetail,
+        router,
+        type WrappedComponent,
+    } from 'svelte-spa-router'
+    import active from 'svelte-spa-router/active'
+    import { wrap } from 'svelte-spa-router/wrap'
+    import AnalyticsConsentModal from './AnalyticsConsentModal.svelte'
+    import { ADMIN_PERMISSIONS } from './lib/store'
 
-import Router, { link } from 'svelte-spa-router'
-import active from 'svelte-spa-router/active'
-import { wrap } from 'svelte-spa-router/wrap'
-import ThemeSwitcher from 'common/ThemeSwitcher.svelte'
-import Logo from 'common/Logo.svelte'
-import DelayedSpinner from 'common/DelayedSpinner.svelte'
+    let showAnalyticsModal = $state(false)
+    $effect(() => {
+        if (
+            ($serverInfo?.shouldPromptAnalytics ?? false) &&
+            $serverInfo?.adminPermissions?.configEdit
+        ) {
+            setTimeout(() => {
+                showAnalyticsModal = true
+            }, 1000)
+        }
+    })
 
-async function init () {
-    await reloadServerInfo()
-}
+    async function init() {
+        await reloadServerInfo()
+        const adminPermissions = get(serverInfo)?.adminPermissions
+        if (
+            !get(serverInfo)?.username ||
+            !adminPermissions ||
+            !ADMIN_PERMISSIONS.some(p => adminPermissions[p.key])
+        ) {
+            // Not logged in: redirect to the (gateway) login page, preserving this admin
+            // URL — hash route included — as `next` so we return exactly here afterwards.
+            // (The admin shell is no longer server-gated, so this runs client-side where
+            // the SPA hash route is known.)
+            const next = location.pathname + location.hash
+            location.assign(
+                `/@warpgate#/login?next=${encodeURIComponent(next)}`,
+            )
+            await new Promise(() => undefined)
+        }
+        if (get(serverInfo)?.needsMfaSetup) {
+            location.assign('/@warpgate#/mfa-setup')
+            await new Promise(() => undefined)
+        }
+    }
 
-async function logout () {
-    await api.logout()
-    await reloadServerInfo()
-    location.href = '/@warpgate'
-}
+    const initPromise = init()
 
-init()
+    const routes: Record<string, WrappedComponent> = {
+        '/': wrap({
+            component: Redirect,
+            props: { to: '/status/sessions' },
+        }),
+        '/status/recordings/:id': wrap({
+            asyncComponent: () => import('./status/Recording.svelte'),
+        }),
+        '/status': wrap({
+            asyncComponent: () => import('./status/Status.svelte'),
+        }),
+        '/log': wrap({
+            asyncComponent: () => import('./Log.svelte'),
+        }),
+        '/log/user/:id': wrap({
+            asyncComponent: () => import('./Log.svelte'),
+            props: {
+                filterKind: 'user',
+            },
+        }),
+        '/log/access-role/:id': wrap({
+            asyncComponent: () => import('./Log.svelte'),
+            props: {
+                filterKind: 'access-role',
+            },
+        }),
+        '/log/admin-role/:id': wrap({
+            asyncComponent: () => import('./Log.svelte'),
+            props: {
+                filterKind: 'admin-role',
+            },
+        }),
+        '/config': wrap({
+            asyncComponent: () => import('./config/Config.svelte'),
+        }),
+    }
+    // biome-ignore lint/style/noNonNullAssertion: x
+    routes['/config/*'] = routes['/config']!
+    // biome-ignore lint/style/noNonNullAssertion: x
+    routes['/status/*'] = routes['/status']!
 
-const routes = {
-    '/': wrap({
-        asyncComponent: () => import('./Home.svelte'),
-    }),
-    '/sessions/:id': wrap({
-        asyncComponent: () => import('./Session.svelte'),
-    }),
-    '/recordings/:id': wrap({
-        asyncComponent: () => import('./Recording.svelte'),
-    }),
-    '/tickets': wrap({
-        asyncComponent: () => import('./Tickets.svelte'),
-    }),
-    '/tickets/create': wrap({
-        asyncComponent: () => import('./CreateTicket.svelte'),
-    }),
-    '/config': wrap({
-        asyncComponent: () => import('./Config.svelte'),
-    }),
-    '/targets/create': wrap({
-        asyncComponent: () => import('./CreateTarget.svelte'),
-    }),
-    '/targets/:id': wrap({
-        asyncComponent: () => import('./Target.svelte'),
-    }),
-    '/roles/create': wrap({
-        asyncComponent: () => import('./CreateRole.svelte'),
-    }),
-    '/roles/:id': wrap({
-        asyncComponent: () => import('./Role.svelte'),
-    }),
-    '/users/create': wrap({
-        asyncComponent: () => import('./CreateUser.svelte'),
-    }),
-    '/users/:id': wrap({
-        asyncComponent: () => import('./User.svelte'),
-    }),
-    '/ssh': wrap({
-        asyncComponent: () => import('./SSH.svelte'),
-    }),
-    '/log': wrap({
-        asyncComponent: () => import('./Log.svelte'),
-    }),
-}
+    const wideMode = $derived(router.location.startsWith('/log'))
 </script>
 
-{#await init()}
-    <DelayedSpinner />
-{:then}
-    <div class="app container">
+<Loadable promise={initPromise}>
+    <div
+        class="app"
+        class:container-lg={!wideMode}
+        class:container-max={wideMode}
+    >
         <header>
-            <a href="/@warpgate" class="d-flex">
-                <div class="logo">
-                    <Logo />
-                </div>
+            <a href="/@warpgate" class="d-flex logo-link me-4">
+                <Brand />
             </a>
             {#if $serverInfo?.username}
-                <a use:link use:active href="/">Sessions</a>
-                <a use:link use:active href="/config">Config</a>
-                <a use:link use:active href="/tickets">Tickets</a>
-                <a use:link use:active href="/ssh">SSH</a>
+                <a
+                    use:link
+                    use:active={{path: /^\/status\//}}
+                    href="/status/sessions"
+                >
+                    Status
+                </a>
+                <a
+                    use:link
+                    use:active
+                    use:active={{path: /^\/config\//}}
+                    href="/config"
+                >
+                    Config
+                </a>
                 <a use:link use:active href="/log">Log</a>
             {/if}
-            {#if $serverInfo?.username}
-            <div class="username ms-auto">
-                {$serverInfo?.username}
+            <span class="ms-3"></span>
+            <div class="ms-auto d-flex align-items-center">
+                <RequestsButton collapsed class="me-4" />
+                <AuthBar />
             </div>
-            <button class="btn btn-link" on:click={logout} title="Log out">
-                <Fa icon={faSignOut} fw />
-            </button>
-            {/if}
         </header>
         <main>
-            <Router {routes}/>
+            {#if $serverInfo?.configWarnings?.length}
+                <Alert color="warning" fade={false}>
+                    <strong>Issues found:</strong>
+                    <ul class="mb-0 mt-2">
+                        {#each $serverInfo.configWarnings as warning (warning)}
+                            <li>{@html warning}</li>
+                        {/each}
+                    </ul>
+                </Alert>
+            {/if}
+            <Router {routes} />
         </main>
 
-        <footer class="mt-5">
-            <span class="me-auto">
-                v{$serverInfo?.version}
-            </span>
+        <footer class="d-flex mt-5 gap-3">
+            <div>
+                {$serverInfo?.version}
+            </div>
+            &middot;
+            <div class="d-flex align-items-center gap-2">
+                <Fa icon={faGithub} class="text-muted" />
+                <a target="_blank" href="https://github.com/warp-tech/warpgate">
+                    GitHub
+                </a>
+            </div>
+            &middot;
+            <div class="d-flex align-items-center gap-2">
+                <Fa icon={faBriefcase} class="text-muted" />
+                <a
+                    target="_blank"
+                    href="https://warpgate.null.page/for-business/"
+                >
+                    Professional support
+                </a>
+            </div>
+            <div class="me-auto"></div>
             <ThemeSwitcher />
         </footer>
     </div>
-{/await}
+</Loadable>
+
+{#if showAnalyticsModal}
+    <AnalyticsConsentModal bind:isOpen={showAnalyticsModal} />
+{/if}
 
 <style lang="scss">
+    @media (max-width: 767px) {
+        .logo-link {
+            display: none !important;
+        }
+    }
+
     .app {
         min-height: 100vh;
         display: flex;
         flex-direction: column;
-    }
 
-    .logo {
-        width: 40px;
-        padding-top: 2px;
-        display: flex;
+        &.container-max {
+            margin: 0 30px;
+        }
     }
 
     header, footer {
@@ -127,20 +207,20 @@ const routes = {
 
     main {
         flex: 1 0 0;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
     }
 
     header {
         display: flex;
         align-items: center;
-        padding: 10px 0;
+        padding: 7px 0;
         margin: 10px 0 20px;
 
-        a, .logo {
+        a {
             font-size: 1.5rem;
-        }
-
-        a:not(:first-child) {
-            margin-left: 15px;
+            margin-right: 15px;
         }
     }
 </style>
